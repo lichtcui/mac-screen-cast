@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use threadpool::ThreadPool;
 
 use core_graphics::base::{kCGBitmapByteOrder32Big, kCGBitmapByteOrder32Little, kCGImageAlphaNoneSkipFirst};
 use core_graphics::color_space::CGColorSpace;
@@ -322,6 +323,7 @@ fn main() {
     let mjpeg_fv = frame_version.clone();
     let mjpeg_sig = signal.clone();
     let mjpeg_stop = stop.clone();
+    let pool = ThreadPool::new(16);
 
     let mjpeg = thread::spawn(move || {
         let listener = match TcpListener::bind("0.0.0.0:8081") {
@@ -333,13 +335,11 @@ fn main() {
             if mjpeg_stop.load(Ordering::Relaxed) { break; }
             match listener.accept() {
                 Ok((stream, _)) => {
-                    thread::spawn({
-                        let f = mjpeg_frame.clone();
-                        let v = mjpeg_fv.clone();
-                        let sig = mjpeg_sig.clone();
-                        let s = mjpeg_stop.clone();
-                        move || handle_mjpeg_client(stream, f, v, sig, s)
-                    });
+                    let f = mjpeg_frame.clone();
+                    let v = mjpeg_fv.clone();
+                    let sig = mjpeg_sig.clone();
+                    let s = mjpeg_stop.clone();
+                    pool.execute(move || handle_mjpeg_client(stream, f, v, sig, s));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(100));
