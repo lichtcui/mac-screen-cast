@@ -111,7 +111,7 @@ fn main() {
             let url = req.url();
             let path = url.split('?').next().unwrap_or("/");
             let resp = match path {
-                "/" => Response::from_data(server::html().into_bytes())
+                "/" => Response::from_data(server::html(fps).into_bytes())
                     .with_header("Content-Type: text/html; charset=utf-8".parse::<Header>().unwrap()),
                 "/init.mp4" => {
                     srv_last_h264.store(epoch_millis(), Ordering::Relaxed);
