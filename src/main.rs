@@ -434,11 +434,17 @@ unsafe extern "C" fn encode_callback(
 
     let pts = CMSampleBufferGetPresentationTimeStamp(sample_buffer);
 
-    // Determine if this is a keyframe by checking the first NAL unit type
-    let is_keyframe = if len > 5 {
-        (data[4] & 0x1f) == 5 // NAL unit type 5 = IDR
-    } else {
-        false
+    // Determine if this is a keyframe by scanning NAL units for IDR (type 5)
+    let is_keyframe = {
+        let mut pos = 0usize;
+        let mut kf = false;
+        while pos + 5 <= len {
+            let nal_sz = u32::from_be_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+            if nal_sz == 0 || pos + 4 + nal_sz > len { break; }
+            if (data[pos+4] & 0x1f) == 5 { kf = true; break; }
+            pos += 4 + nal_sz;
+        }
+        kf
     };
 
     let frame = H264Frame {
