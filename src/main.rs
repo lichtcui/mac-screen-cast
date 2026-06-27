@@ -975,6 +975,7 @@ fn main() {
     let video_init: Arc<ArcSwap<Vec<u8>>> = Arc::new(ArcSwap::from_pointee(Vec::new()));
     let video_segments: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let video_seg_count: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+    let video_seg_base: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
     let svr_f = frame.clone();
     let svr_s = stop.clone();
     let svr_w = wid;
@@ -982,7 +983,9 @@ fn main() {
 
     let srv_video_init = video_init.clone();
     let srv_video_segs = video_segments.clone();
-    let srv_video_count = video_seg_count.clone();
+    let _srv_video_count = video_seg_count.clone();
+    let srv_video_base = video_seg_base.clone();
+
     let srv = thread::spawn(move || {
         use tiny_http::{Header, Response};
         let server = match tiny_http::Server::http("0.0.0.0:8080") {
@@ -1036,10 +1039,10 @@ fn main() {
                     let mut result = Response::from_data(Vec::new()).with_status_code(503);
                     for _ in 0..100 {
                         if svr_s.load(Ordering::Relaxed) { break; }
-                        let current = srv_video_count.load(Ordering::Acquire);
-                        if current > after {
+                        let base = srv_video_base.load(Ordering::Acquire);
+                        if after >= base {
+                            let idx = (after - base) as usize;
                             let segs = srv_video_segs.lock().unwrap();
-                            let idx = after as usize;
                             if idx < segs.len() {
                                 result = Response::from_data(segs[idx].clone())
                                     .with_header(hdr_ct_video())
@@ -1155,6 +1158,7 @@ fn main() {
     let vt_init = video_init.clone();
     let vt_segs = video_segments.clone();
     let vt_count = video_seg_count.clone();
+    let vt_base = video_seg_base.clone();
 
     while !stop.load(Ordering::Relaxed) {
         // Single capture shared between JPEG and H.264
@@ -1224,7 +1228,7 @@ fn main() {
                             );
                             let mut segs = vt_segs.lock().unwrap();
                             segs.push(seg);
-                            if segs.len() > 300 { segs.remove(0); }
+                            if segs.len() > 300 { segs.remove(0); vt_base.fetch_add(1, Ordering::Release); }
                             vt_count.fetch_add(1, Ordering::Release);
                             if !h264_ready {
                                 h264_ready = true;
