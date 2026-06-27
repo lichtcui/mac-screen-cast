@@ -22,9 +22,7 @@ extern "C" {
 
 // ---------- Core Graphics window capture ----------
 
-fn capture_window(window_id: u32) -> Option<Vec<u8>> {
-    const MAX_W: u32 = 1280;
-    const Q: u8 = 70;
+fn capture_window(window_id: u32, max_w: u32, quality: u8) -> Option<Vec<u8>> {
 
     let cg = capture_cgimage(window_id)?;
     let (w, h) = (cg.width() as u32, cg.height() as u32);
@@ -35,17 +33,17 @@ fn capture_window(window_id: u32) -> Option<Vec<u8>> {
     let rgb = read_cgimage_rgb(&cg).or_else(|| render_cgimage_to_rgb(&cg))?;
 
     // Scale if wider than limit — Nearest filter for speed
-    let (fw, fh, data) = if w > MAX_W {
-        let nh = (h * MAX_W) / w;
+    let (fw, fh, data) = if w > max_w {
+        let nh = (h * max_w) / w;
         let img = image::RgbImage::from_raw(w, h, rgb)?;
-        let scaled = image::imageops::resize(&img, MAX_W, nh, image::imageops::FilterType::Nearest);
-        (MAX_W, nh, scaled.into_raw())
+        let scaled = image::imageops::resize(&img, max_w, nh, image::imageops::FilterType::Nearest);
+        (max_w, nh, scaled.into_raw())
     } else {
         (w, h, rgb)
     };
 
     let mut buf = Vec::new();
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, Q);
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
     enc.encode(&data, fw, fh, image::ExtendedColorType::Rgb8).ok()?;
 
     if buf.len() > 500 { Some(buf) } else { None }
@@ -216,11 +214,17 @@ fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, v
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut wid: u32 = 0;
+    let mut max_w: u32 = 1280;
+    let mut quality: u8 = 70;
+    let mut fps: u32 = 30;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "-w" | "--window-id" => { i += 1; wid = args[i].parse().unwrap_or(0); }
+            "--width" => { i += 1; max_w = args[i].parse().unwrap_or(1280); }
+            "-q" | "--quality" => { i += 1; quality = args[i].parse().unwrap_or(70); }
+            "--fps" => { i += 1; fps = args[i].parse().unwrap_or(30).clamp(1, 60); }
             "-l" | "--list" => {
                 for (id, app, title) in list_windows() {
                     println!("{:>5} | {} | {}", id, app, title);
@@ -228,7 +232,7 @@ fn main() {
                 return;
             }
             "-h" | "--help" => {
-                println!("screenstream [-l] [-w <id>]");
+                println!("screenstream [-l] [-w <id>] [--width <px>] [-q|--quality <1-100>] [--fps <1-60>]");
                 return;
             }
             _ => {}
@@ -350,11 +354,11 @@ fn main() {
     let mut fc: u64 = 0;
     let mut last = Instant::now();
     let mut fpc: u32 = 0;
-    let frame_dur = Duration::from_secs_f64(1.0 / 30.0);
+    let frame_dur = Duration::from_secs_f64(1.0 / fps as f64);
     let mut next_capture = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
-        if let Some(jpeg) = capture_window(wid) {
+        if let Some(jpeg) = capture_window(wid, max_w, quality) {
             *frame.lock().unwrap() = Arc::new(jpeg);
             frame_version.fetch_add(1, Ordering::Release);
             frame_signal.notify_all();
