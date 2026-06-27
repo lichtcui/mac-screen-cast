@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::hash::{DefaultHasher, Hasher};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,24 +10,23 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use threadpool::ThreadPool;
 
-use core_graphics::base::{kCGBitmapByteOrder32Big, kCGBitmapByteOrder32Little, kCGImageAlphaNoneSkipFirst};
+use core_graphics::base::{kCGBitmapByteOrder32Big, kCGImageAlphaNoneSkipFirst};
 use core_graphics::color_space::CGColorSpace;
-use core_graphics::context::CGContext;
+use core_graphics::context::{CGContext, CGInterpolationQuality};
 use core_graphics::geometry::{CGRect, CGPoint, CGSize};
 use core_graphics::image::CGImage;
 use core_graphics::window;
 use foreign_types::ForeignType;
 
-// ---------- pixel-format introspection ----------
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGImageGetBitmapInfo(image: *mut std::ffi::c_void) -> u32;
-}
+use core_foundation::base::{CFIndex, CFRelease, CFType, TCFType};
+use core_foundation::data::{CFMutableDataRef, CFDataCreateMutable, CFDataGetMutableBytePtr, CFDataGetLength};
+use core_foundation::dictionary::CFMutableDictionary;
+use core_foundation::number::CFNumber;
+use core_foundation::string::{CFString, CFStringRef};
 
 // ---------- Core Graphics window capture ----------
 
-fn capture_window(window_id: u32, max_w: u32, quality: u8,
-    rgb: &mut Vec<u8>, scaled: &mut Vec<u8>, jpeg_out: &mut Vec<u8>) -> bool
+fn capture_window(window_id: u32, max_w: u32, quality: u8, jpeg_out: &mut Vec<u8>) -> bool
 {
     let cg = match capture_cgimage(window_id) {
         Some(c) => c, None => return false,
@@ -34,28 +34,26 @@ fn capture_window(window_id: u32, max_w: u32, quality: u8,
     let (w, h) = (cg.width() as u32, cg.height() as u32);
     if w == 0 || h == 0 { return false; }
 
-    // Fill rgb from CGImage pixels
-    if !read_cgimage_rgb(&cg, rgb) && !render_cgimage_to_rgb(&cg, rgb) { return false; }
-
-    // Scale if wider than limit — Triangle filter
-    let (fw, fh, data) = if w > max_w {
+    // Scale via CoreGraphics if wider than limit (hardware-accelerated on Apple Silicon)
+    let encode_image = if w > max_w {
         let nh = (h * max_w) / w;
-        let img = match image::RgbImage::from_raw(w, h, std::mem::take(rgb)) {
-            Some(i) => i, None => return false,
-        };
-        let s = image::imageops::resize(&img, max_w, nh, image::imageops::FilterType::Triangle);
-        *scaled = s.into_raw();
-        (max_w, nh, scaled.as_slice())
+        let cs = CGColorSpace::create_device_rgb();
+        let ctx = CGContext::create_bitmap_context(
+            None, max_w as usize, nh as usize, 8, max_w as usize * 4, &cs,
+            kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipFirst,
+        );
+        ctx.set_interpolation_quality(CGInterpolationQuality::CGInterpolationQualityHigh);
+        let rect = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(max_w as _, nh as _));
+        ctx.draw_image(rect, &cg);
+        match ctx.create_image() {
+            Some(img) => img,
+            None => return false,
+        }
     } else {
-        (w, h, rgb.as_slice())
+        cg
     };
 
-    jpeg_out.clear();
-    {
-        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut *jpeg_out, quality);
-        if enc.encode(data, fw, fh, image::ExtendedColorType::Rgb8).is_err() { return false; }
-    }
-    jpeg_out.len() > 500
+    encode_native_jpeg(&encode_image, quality, jpeg_out)
 }
 
 fn capture_cgimage(window_id: u32) -> Option<CGImage> {
@@ -71,79 +69,74 @@ fn capture_cgimage(window_id: u32) -> Option<CGImage> {
     )
 }
 
-/// Read CGImage pixels directly and convert to packed RGB.
-fn read_cgimage_rgb(image: &CGImage, out: &mut Vec<u8>) -> bool {
-    let w = image.width();
-    let h = image.height();
-    if w == 0 || h == 0 { return false; }
-    if image.bits_per_pixel() != 32 { return false; }
+// ---------- native JPEG encoding via ImageIO ----------
 
-    let bpr = image.bytes_per_row();
-    let raw_ptr = image.as_ptr() as *mut std::ffi::c_void;
-    let bitmap_info = unsafe { CGImageGetBitmapInfo(raw_ptr) };
-    let byte_order = bitmap_info & 0x7000;
+#[link(name = "ImageIO", kind = "framework")]
+extern "C" {
+    static kCGImageDestinationLossyCompressionQuality: CFStringRef;
 
-    let cf_data = image.data();
-    let raw: &[u8] = &cf_data;
-    if raw.len() < h.saturating_mul(bpr) { return false; }
+    fn CGImageDestinationCreateWithData(
+        data: CFMutableDataRef,
+        type_: CFStringRef,
+        count: CFIndex,
+        options: *const std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
 
-    out.clear();
-    out.reserve(w * h * 3);
-
-    match byte_order {
-        // BGRA: bytes = [B, G, R, A] (most macOS systems)
-        a if a == kCGBitmapByteOrder32Little => {
-            for row in 0..h {
-                let r = &raw[row * bpr..][..w * 4];
-                for px in r.chunks_exact(4) {
-                    out.push(px[2]);
-                    out.push(px[1]);
-                    out.push(px[0]);
-                }
-            }
-        }
-        // XRGB big-endian: bytes = [X, R, G, B]
-        a if a == kCGBitmapByteOrder32Big => {
-            for row in 0..h {
-                let r = &raw[row * bpr..][..w * 4];
-                for px in r.chunks_exact(4) {
-                    out.push(px[1]);
-                    out.push(px[2]);
-                    out.push(px[3]);
-                }
-            }
-        }
-        _ => return false,
-    }
-
-    true
-}
-
-/// Fallback: render through a known-format bitmap context.
-fn render_cgimage_to_rgb(image: &CGImage, out: &mut Vec<u8>) -> bool {
-    let w = image.width();
-    let h = image.height();
-    if w == 0 || h == 0 { return false; }
-
-    let cs = CGColorSpace::create_device_rgb();
-    let bpr = w * 4;
-    let mut ctx = CGContext::create_bitmap_context(
-        None, w, h, 8, bpr, &cs,
-        kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipFirst,
+    fn CGImageDestinationAddImage(
+        dest: *mut std::ffi::c_void,
+        image: *const std::ffi::c_void,
+        properties: *const std::ffi::c_void,
     );
 
-    let rect = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(w as _, h as _));
-    ctx.draw_image(rect, image);
+    fn CGImageDestinationFinalize(dest: *mut std::ffi::c_void) -> u8;
+}
 
-    let raw = ctx.data();
-    out.clear();
-    out.reserve(w * h * 3);
-    for px in raw.chunks_exact(4) {
-        out.push(px[1]);
-        out.push(px[2]);
-        out.push(px[3]);
+fn encode_native_jpeg(image: &CGImage, quality: u8, out: &mut Vec<u8>) -> bool {
+    unsafe {
+        let data = CFDataCreateMutable(std::ptr::null_mut(), 0);
+        if data.is_null() {
+            return false;
+        }
+
+        let uti = CFString::new("public.jpeg");
+        let dest = CGImageDestinationCreateWithData(data, uti.as_concrete_TypeRef(), 1, std::ptr::null());
+        if dest.is_null() {
+            CFRelease(data as *const _);
+            return false;
+        }
+        let dest = CFType::wrap_under_create_rule(dest as *const _);
+
+        // Properties: { kCGImageDestinationLossyCompressionQuality = quality/100.0 }
+        let quality_val = CFNumber::from(quality as f64 / 100.0);
+        let mut props = CFMutableDictionary::<*const std::ffi::c_void, *const std::ffi::c_void>::new();
+        props.add(
+            &(kCGImageDestinationLossyCompressionQuality as *const std::ffi::c_void),
+            &(quality_val.as_CFTypeRef()),
+        );
+
+        CGImageDestinationAddImage(
+            dest.as_concrete_TypeRef() as *mut _,
+            image.as_ptr() as *const _,
+            props.as_concrete_TypeRef() as *const _,
+        );
+
+        let ok = CGImageDestinationFinalize(dest.as_concrete_TypeRef() as *mut _);
+
+        if ok != 0 {
+            let len = CFDataGetLength(data);
+            if len > 0 {
+                let ptr = CFDataGetMutableBytePtr(data);
+                if !ptr.is_null() {
+                    let bytes = std::slice::from_raw_parts(ptr, len as usize);
+                    out.clear();
+                    out.extend_from_slice(bytes);
+                }
+            }
+        }
+
+        CFRelease(data as *const _);
+        ok != 0
     }
-    true
 }
 
 // ---------- window listing ----------
@@ -362,22 +355,38 @@ fn main() {
         c_sig.1.notify_all();
     }).ok();
 
-    let mut rgb_buf = Vec::new();
-    let mut scaled_buf = Vec::new();
     let mut jpeg_buf = Vec::new();
     let mut fc: u64 = 0;
     let mut last = Instant::now();
     let mut fpc: u32 = 0;
-    let frame_dur = Duration::from_secs_f64(1.0 / fps as f64);
+    let frame_dur_active = Duration::from_secs_f64(1.0 / fps as f64);
+    let mut frame_dur = frame_dur_active;
     let mut next_capture = Instant::now();
+    let mut content_hash = 0u64;
+    let mut idle_count = 0u32;
 
     while !stop.load(Ordering::Relaxed) {
-        if capture_window(wid, max_w, quality, &mut rgb_buf, &mut scaled_buf, &mut jpeg_buf) {
-            let jpeg = std::mem::take(&mut jpeg_buf);
-            frame.store(Arc::new(jpeg));
-            frame_version.fetch_add(1, Ordering::Release);
-            signal.1.notify_all();
-            fc += 1; fpc += 1;
+        if capture_window(wid, max_w, quality, &mut jpeg_buf) {
+            let h = {
+                let mut s = DefaultHasher::new();
+                s.write(&jpeg_buf);
+                s.finish()
+            };
+            if h == content_hash {
+                idle_count += 1;
+                if idle_count > 5 {
+                    frame_dur = Duration::from_secs_f64(1.0);
+                }
+            } else {
+                content_hash = h;
+                idle_count = 0;
+                frame_dur = frame_dur_active;
+                let jpeg = std::mem::take(&mut jpeg_buf);
+                frame.store(Arc::new(jpeg));
+                frame_version.fetch_add(1, Ordering::Release);
+                signal.1.notify_all();
+                fc += 1; fpc += 1;
+            }
         }
         let now = Instant::now();
         if now < next_capture {
@@ -388,7 +397,7 @@ fn main() {
             next_capture = now;
         }
         if last.elapsed() >= Duration::from_secs(5) {
-            let fps = fpc as f64 / last.elapsed().as_secs_f64();
+            let fps = if fpc > 0 { fpc as f64 / last.elapsed().as_secs_f64() } else { 0.0 };
             eprintln!("  {:4.0} fps | {} frames", fps, fc);
             fpc = 0; last = Instant::now();
         }

@@ -7,7 +7,7 @@ edition = "2021"
 tiny_http = "0.12"
 ctrlc = "3.4"
 core-graphics = "0.25"
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+core-foundation = "0.10"
 foreign-types = "0.5"
 arc-swap = "1"
 threadpool = "1"
