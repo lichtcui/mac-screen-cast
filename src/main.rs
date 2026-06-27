@@ -349,21 +349,27 @@ impl VtEncoder {
             timescale: frame_dur_tscale,
             flags: 0, epoch: 0,
         };
-        unsafe {
+        let encode_status = unsafe {
             VTCompressionSessionEncodeFrame(
                 self.session, pb, pts, dur,
                 std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(),
-            );
-        }
+            )
+        };
 
         // Release our ref — VT retains it internally
         unsafe { CFRelease(pb as *const _); }
 
-        // Sync: flush + wait for callback
+        if encode_status != 0 {
+            unsafe { VTCompressionSessionCompleteFrames(self.session, kCMTimeInvalid); }
+            return Err(format!("VTCompressionSessionEncodeFrame failed: {}", encode_status));
+        }
+
+        // Sync: flush + wait for callback (with timeout to prevent freezing)
         unsafe {
             VTCompressionSessionCompleteFrames(self.session, kCMTimeInvalid);
         }
-        self.rx.recv().map_err(|e| format!("recv: {}", e))
+        self.rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|e| format!("encode timeout/error: {:?}", e))
     }
 
 }
@@ -1151,55 +1157,57 @@ fn main() {
     let vt_count = video_seg_count.clone();
 
     while !stop.load(Ordering::Relaxed) {
-        if capture_window(wid, max_w, quality, &mut jpeg_buf) {
-            let h = {
-                let mut s = DefaultHasher::new();
-                s.write(&jpeg_buf);
-                s.finish()
-            };
-            if h == content_hash {
-                idle_count += 1;
-                if idle_count > 5 {
-                    frame_dur = Duration::from_secs_f64(1.0);
-                }
+        // Single capture shared between JPEG and H.264
+        let shared_cg = capture_cgimage(wid).and_then(|cg| {
+            let (w, h) = (cg.width() as u32, cg.height() as u32);
+            if w == 0 || h == 0 { return None; }
+            if w > max_w {
+                let nh = (h * max_w) / w;
+                let cs = CGColorSpace::create_device_rgb();
+                let ctx = CGContext::create_bitmap_context(
+                    None, max_w as usize, nh as usize, 8, max_w as usize * 4, &cs,
+                    kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipFirst,
+                );
+                ctx.set_interpolation_quality(CGInterpolationQuality::CGInterpolationQualityHigh);
+                let rect = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(max_w as _, nh as _));
+                ctx.draw_image(rect, &cg);
+                ctx.create_image()
             } else {
-                content_hash = h;
-                idle_count = 0;
-                frame_dur = frame_dur_active;
-                let jpeg = std::mem::take(&mut jpeg_buf);
-                frame.store(Arc::new(jpeg));
-                frame_version.fetch_add(1, Ordering::Release);
-                signal.1.notify_all();
-                fc += 1; fpc += 1;
+                Some(cg)
             }
-        }
+        });
 
-        // H.264 encoding path
-        if let Some(ref encoder) = h264_encoder {
-            let scale_cg = capture_cgimage(wid).and_then(|cg| {
-                let (w, h) = (cg.width() as u32, cg.height() as u32);
-                if w == 0 || h == 0 { return None; }
-                if w > max_w {
-                    let cs = CGColorSpace::create_device_rgb();
-                    let ctx = CGContext::create_bitmap_context(
-                        None, enc_w as usize, enc_h as usize, 8, enc_w as usize * 4, &cs,
-                        kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipFirst,
-                    );
-                    ctx.set_interpolation_quality(CGInterpolationQuality::CGInterpolationQualityHigh);
-                    let rect = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(enc_w as _, enc_h as _));
-                    ctx.draw_image(rect, &cg);
-                    ctx.create_image()
+        if let Some(ref cg) = shared_cg {
+            // JPEG encode from shared CGImage
+            if encode_native_jpeg(cg, quality, &mut jpeg_buf) {
+                let h = {
+                    let mut s = DefaultHasher::new();
+                    s.write(&jpeg_buf);
+                    s.finish()
+                };
+                if h == content_hash {
+                    idle_count += 1;
+                    if idle_count > 5 {
+                        frame_dur = Duration::from_secs_f64(1.0);
+                    }
                 } else {
-                    Some(cg) // native size, use directly
+                    content_hash = h;
+                    idle_count = 0;
+                    frame_dur = frame_dur_active;
+                    let jpeg = std::mem::take(&mut jpeg_buf);
+                    frame.store(Arc::new(jpeg));
+                    frame_version.fetch_add(1, Ordering::Release);
+                    signal.1.notify_all();
+                    fc += 1; fpc += 1;
                 }
-            });
+            }
 
-            if let Some(ref cg) = scale_cg {
+            // H.264 encode from same CGImage
+            if let Some(ref encoder) = h264_encoder {
                 match encoder.encode_frame(cg, h264_frame_count, 30) {
                     Ok(frame) => {
                         h264_frame_count += 1;
 
-                        // Initialize fMP4 on first keyframe
                         if h264_fmp4.is_none() && frame.sps.is_some() && frame.pps.is_some() {
                             let sps = frame.sps.clone().unwrap();
                             let pps = frame.pps.clone().unwrap();
@@ -1225,13 +1233,11 @@ fn main() {
                         }
                     }
                     Err(e) => {
-                        // If encoder fails repeatedly, disable it
                         eprintln!("  H.264 encode error: {}", e);
                     }
                 }
             }
         }
-
         let now = Instant::now();
         if now < next_capture {
             thread::sleep(next_capture - now);
