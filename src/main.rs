@@ -1,4 +1,5 @@
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -168,6 +169,38 @@ fn get_ip() -> String {
         .output().map(|o| String::from_utf8_lossy(&o.stdout).trim().into()).unwrap_or_default()
 }
 
+// ---------- MJPEG stream ----------
+
+fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Vec<u8>>>, stop: Arc<AtomicBool>) {
+    let mut buf = [0u8; 4096];
+    if stream.read(&mut buf).is_err() { return; }
+    let req = String::from_utf8_lossy(&buf);
+    if !req.starts_with("GET /stream") { return; }
+
+    let _ = stream.set_nodelay(true);
+    let header = "HTTP/1.1 200 OK\r\n\
+                  Content-Type: multipart/x-mixed-replace; boundary=--frame\r\n\
+                  Cache-Control: no-cache\r\n\
+                  Connection: close\r\n\r\n";
+    if stream.write_all(header.as_bytes()).is_err() { return; }
+
+    let mut last_len = 0usize;
+    loop {
+        if stop.load(Ordering::Relaxed) { break; }
+        let jpeg = frame.lock().unwrap().clone();
+        if !jpeg.is_empty() && jpeg.len() != last_len {
+            let part = format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", jpeg.len());
+            if stream.write_all(part.as_bytes()).is_err() { break; }
+            if stream.write_all(&jpeg).is_err() { break; }
+            if stream.write_all(b"\r\n").is_err() { break; }
+            let _ = stream.flush();
+            last_len = jpeg.len();
+        } else {
+            thread::sleep(Duration::from_millis(16));
+        }
+    }
+}
+
 // ---------- main ----------
 
 fn main() {
@@ -228,6 +261,7 @@ fn main() {
         };
         eprintln!("\n{:->50}", "");
         eprintln!("  ScreenStream  |  window {}  |  http://{}:8080", svr_w, ip);
+        eprintln!("  MJPEG stream  |             |  http://{}:8081/stream", ip);
         eprintln!("{:->50}\n", "");
 
         loop {
@@ -254,6 +288,33 @@ fn main() {
                 _ => Response::from_data(Vec::new()).with_status_code(404),
             };
             req.respond(resp).ok();
+        }
+    });
+
+    let mjpeg_frame = frame.clone();
+    let mjpeg_stop = stop.clone();
+
+    let mjpeg = thread::spawn(move || {
+        let listener = match TcpListener::bind("0.0.0.0:8081") {
+            Ok(l) => l,
+            Err(e) => { eprintln!("端口 8081 被占用: {}", e); return; }
+        };
+        let _ = listener.set_nonblocking(true);
+        loop {
+            if mjpeg_stop.load(Ordering::Relaxed) { break; }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    thread::spawn({
+                        let f = mjpeg_frame.clone();
+                        let s = mjpeg_stop.clone();
+                        move || handle_mjpeg_client(stream, f, s)
+                    });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => break,
+            }
         }
     });
 
@@ -285,4 +346,5 @@ fn main() {
     }
 
     srv.join().ok();
+    mjpeg.join().ok();
 }
