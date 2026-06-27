@@ -844,7 +844,8 @@ fn html() -> String {
     r#"<!DOCTYPE html><html><meta charset="utf-8"><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>ScreenStream</title><style>*{margin:0;background:#000}body{display:flex;min-height:100vh;min-height:100dvh;align-items:center;justify-content:center}video{width:100%;max-height:100vh;max-height:100dvh}#b{position:fixed;bottom:0;left:0;right:0;display:flex;gap:12px;padding:3px 10px;background:rgba(0,0,0,.5);color:#aaa;font:11px/1.3 monospace;z-index:99;user-select:none}}.g{color:#4a4}.r{color:#c44}</style><body><video id=v autoplay muted playsinline></video><div id=b><span id=st class=g>loading</span></div><script>
 let v=document.getElementById('v'),st=document.getElementById('st'),init=!1,m,ab,seg=0;
 fetch('/init.mp4').then(r=>r.arrayBuffer()).then(b=>{
-let codecs='avc1.'+Array.from(new Uint8Array(b.slice(20,24)).slice(1)).map(x=>x.toString(16).padStart(2,'0')).join('');
+let d=new Uint8Array(b),p=-1;for(let i=0;i<d.length-4;i++){if(d[i]===0x61&&d[i+1]===0x76&&d[i+2]===0x63&&d[i+3]===0x43){p=i+5;break}}
+let codecs='avc1.'+[d[p],d[p+1],d[p+2]].map(x=>x.toString(16).padStart(2,'0')).join('');
 m=new MediaSource();m.onsourceopen=()=>{ab=m.addSourceBuffer('video/mp4;codecs="'+codecs+'"');ab.appendBuffer(b)};
 v.src=URL.createObjectURL(m)
 }).catch(()=>{st.textContent='no h264';st.className='r'});
