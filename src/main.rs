@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -173,7 +173,7 @@ fn get_ip() -> String {
 
 // ---------- MJPEG stream ----------
 
-fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, version: Arc<AtomicU64>, stop: Arc<AtomicBool>) {
+fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, version: Arc<AtomicU64>, signal: Arc<(Mutex<bool>, Condvar)>, stop: Arc<AtomicBool>) {
     let mut buf = [0u8; 4096];
     if stream.read(&mut buf).is_err() { return; }
     let req = String::from_utf8_lossy(&buf);
@@ -201,7 +201,12 @@ fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, v
                 last_version = ver;
             }
         } else {
-            thread::sleep(Duration::from_millis(16));
+            let (lock, cv) = &*signal;
+            let mut f = lock.lock().unwrap();
+            while !*f {
+                f = cv.wait(f).unwrap();
+            }
+            *f = false;
         }
     }
 }
@@ -252,6 +257,7 @@ fn main() {
 
     let frame: Arc<Mutex<Arc<Vec<u8>>>> = Arc::new(Mutex::new(Arc::new(Vec::new())));
     let frame_version = Arc::new(AtomicU64::new(0));
+    let frame_signal: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
     let stop = Arc::new(AtomicBool::new(false));
 
     let svr_f = frame.clone();
@@ -299,6 +305,7 @@ fn main() {
 
     let mjpeg_frame = frame.clone();
     let mjpeg_fv = frame_version.clone();
+    let mjpeg_cv = frame_signal.clone();
     let mjpeg_stop = stop.clone();
 
     let mjpeg = thread::spawn(move || {
@@ -314,8 +321,9 @@ fn main() {
                     thread::spawn({
                         let f = mjpeg_frame.clone();
                         let v = mjpeg_fv.clone();
+                        let c = mjpeg_cv.clone();
                         let s = mjpeg_stop.clone();
-                        move || handle_mjpeg_client(stream, f, v, s)
+                        move || handle_mjpeg_client(stream, f, v, c, s)
                     });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -345,6 +353,8 @@ fn main() {
         if let Some(jpeg) = capture_window(wid) {
             *frame.lock().unwrap() = Arc::new(jpeg);
             frame_version.fetch_add(1, Ordering::Release);
+            *frame_signal.0.lock().unwrap() = true;
+            frame_signal.1.notify_all();
             fc += 1; fpc += 1;
         }
         if last.elapsed() >= Duration::from_secs(5) {
