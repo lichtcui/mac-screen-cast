@@ -275,11 +275,6 @@ impl VtEncoder {
         enc.set_prop_i32(b"MaxKeyFrameInterval\0", (fps * 2) as i32)?;
         enc.set_prop_i32(b"AverageBitRate\0", 4_000_000)?;
 
-        let status = unsafe { VTCompressionSessionCompleteFrames(session, kCMTimeInvalid) };
-        if status != 0 {
-            return Err(format!("PrepareToEncodeFrames failed: {}", status));
-        }
-
         Ok(enc)
     }
 
@@ -967,8 +962,6 @@ fn main() {
     let video_init: Arc<ArcSwap<Vec<u8>>> = Arc::new(ArcSwap::from_pointee(Vec::new()));
     let video_segments: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let video_seg_count: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
-    let video_signal: Arc<Condvar> = Arc::new(Condvar::new());
-
     let svr_f = frame.clone();
     let svr_s = stop.clone();
     let svr_w = wid;
@@ -977,8 +970,6 @@ fn main() {
     let srv_video_init = video_init.clone();
     let srv_video_segs = video_segments.clone();
     let srv_video_count = video_seg_count.clone();
-    let _srv_video_sig = video_signal.clone();
-
     let srv = thread::spawn(move || {
         use tiny_http::{Header, Response};
         let server = match tiny_http::Server::http("0.0.0.0:8080") {
@@ -1122,17 +1113,35 @@ fn main() {
     let mut content_hash = 0u64;
     let mut idle_count = 0u32;
 
-    // H.264 encoder setup (try, silently continue without if it fails)
-    let h264_encoder: Option<VtEncoder> = VtEncoder::new(max_w, max_w.max(1), fps).ok();
+    // Determine capture dimensions from a test capture
+    let (enc_w, enc_h) = match capture_cgimage(wid) {
+        Some(cg) => {
+            let w = cg.width() as u32;
+            let h = cg.height() as u32;
+            if w > 0 && h > 0 {
+                if w > max_w {
+                    let nh = (h * max_w) / w;
+                    // Ensure even dimensions (VT requirement)
+                    (max_w | 1, nh | 1) // |1 rounds up to odd, then we & !1 for even
+                } else {
+                    (w | 1, h | 1)
+                }
+            } else {
+                (max_w, max_w * 9 / 16)
+            }
+        }
+        None => (max_w, max_w * 9 / 16),
+    };
+    let (enc_w, enc_h) = (enc_w & !1, enc_h & !1); // force even
+
+    let h264_encoder: Option<VtEncoder> = VtEncoder::new(enc_w, enc_h, fps).ok();
     let mut h264_fmp4: Option<Fmp4State> = None;
     let mut h264_frame_count: u64 = 0;
     let mut h264_ready = false;
 
-    // Ensure we get init segment for the video init store
     let vt_init = video_init.clone();
     let vt_segs = video_segments.clone();
     let vt_count = video_seg_count.clone();
-    let vt_sig = video_signal.clone();
 
     while !stop.load(Ordering::Relaxed) {
         if capture_window(wid, max_w, quality, &mut jpeg_buf) {
@@ -1160,35 +1169,23 @@ fn main() {
 
         // H.264 encoding path
         if let Some(ref encoder) = h264_encoder {
-            let (w_cap, h_cap) = {
-                let cg = capture_cgimage(wid);
-                match cg {
-                    Some(ref c) => (c.width() as u32, c.height() as u32),
-                    None => (max_w, max_w.max(1)),
+            let scale_cg = capture_cgimage(wid).and_then(|cg| {
+                let (w, h) = (cg.width() as u32, cg.height() as u32);
+                if w == 0 || h == 0 { return None; }
+                if w > max_w {
+                    let cs = CGColorSpace::create_device_rgb();
+                    let ctx = CGContext::create_bitmap_context(
+                        None, enc_w as usize, enc_h as usize, 8, enc_w as usize * 4, &cs,
+                        kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipFirst,
+                    );
+                    ctx.set_interpolation_quality(CGInterpolationQuality::CGInterpolationQualityHigh);
+                    let rect = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(enc_w as _, enc_h as _));
+                    ctx.draw_image(rect, &cg);
+                    ctx.create_image()
+                } else {
+                    Some(cg) // native size, use directly
                 }
-            };
-            let enc_w = if w_cap > max_w { max_w } else { w_cap };
-            let enc_h = if w_cap > max_w { (h_cap * max_w) / w_cap } else { h_cap };
-
-            let scale_cg = if w_cap > max_w {
-                let nh = (h_cap * max_w) / w_cap;
-                let cs = CGColorSpace::create_device_rgb();
-                let ctx = CGContext::create_bitmap_context(
-                    None, max_w as usize, nh as usize, 8, max_w as usize * 4, &cs,
-                    kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipFirst,
-                );
-                ctx.set_interpolation_quality(CGInterpolationQuality::CGInterpolationQualityHigh);
-                let rect = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(max_w as _, nh as _));
-                match capture_cgimage(wid) {
-                    Some(ref cg) => {
-                        ctx.draw_image(rect, cg);
-                        ctx.create_image()
-                    }
-                    None => None,
-                }
-            } else {
-                capture_cgimage(wid)
-            };
+            });
 
             if let Some(ref cg) = scale_cg {
                 match encoder.encode_frame(cg, h264_frame_count, 30) {
@@ -1214,7 +1211,6 @@ fn main() {
                             segs.push(seg);
                             if segs.len() > 300 { segs.remove(0); }
                             vt_count.fetch_add(1, Ordering::Release);
-                            vt_sig.notify_all();
                             if !h264_ready {
                                 h264_ready = true;
                                 eprintln!("  H.264 stream ready");
