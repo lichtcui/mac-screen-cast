@@ -334,6 +334,7 @@ fn main() {
     });
 
     let c_stop = stop.clone();
+    let c_cv = frame_signal.clone();
     static CTRLC_COUNT: AtomicBool = AtomicBool::new(false);
     ctrlc::set_handler(move || {
         if CTRLC_COUNT.swap(true, Ordering::Relaxed) {
@@ -342,6 +343,7 @@ fn main() {
         }
         eprintln!("\n⏳ 正在停止 (再按一次 Ctrl+C 强制退出)...");
         c_stop.store(true, Ordering::Relaxed);
+        c_cv.notify_all();
     }).ok();
 
     let mut fc: u64 = 0;
