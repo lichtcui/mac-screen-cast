@@ -348,6 +348,8 @@ fn main() {
     let mut fc: u64 = 0;
     let mut last = Instant::now();
     let mut fpc: u32 = 0;
+    let frame_dur = Duration::from_secs_f64(1.0 / 30.0);
+    let mut next_capture = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         if let Some(jpeg) = capture_window(wid) {
@@ -356,6 +358,14 @@ fn main() {
             *frame_signal.0.lock().unwrap() = true;
             frame_signal.1.notify_all();
             fc += 1; fpc += 1;
+        }
+        let now = Instant::now();
+        if now < next_capture {
+            thread::sleep(next_capture - now);
+        }
+        next_capture += frame_dur;
+        if next_capture < now {
+            next_capture = now;
         }
         if last.elapsed() >= Duration::from_secs(5) {
             let fps = fpc as f64 / last.elapsed().as_secs_f64();
