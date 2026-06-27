@@ -174,6 +174,7 @@ fn get_ip() -> String {
 // ---------- MJPEG stream ----------
 
 fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, version: Arc<AtomicU64>, signal: Arc<Condvar>, stop: Arc<AtomicBool>) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut buf = [0u8; 4096];
     if stream.read(&mut buf).is_err() { return; }
     let req = String::from_utf8_lossy(&buf);
