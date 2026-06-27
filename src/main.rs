@@ -22,31 +22,37 @@ extern "C" {
 
 // ---------- Core Graphics window capture ----------
 
-fn capture_window(window_id: u32, max_w: u32, quality: u8) -> Option<Vec<u8>> {
-
-    let cg = capture_cgimage(window_id)?;
+fn capture_window(window_id: u32, max_w: u32, quality: u8,
+    rgb: &mut Vec<u8>, scaled: &mut Vec<u8>, jpeg_out: &mut Vec<u8>) -> bool
+{
+    let cg = match capture_cgimage(window_id) {
+        Some(c) => c, None => return false,
+    };
     let (w, h) = (cg.width() as u32, cg.height() as u32);
-    if w == 0 || h == 0 { return None; }
+    if w == 0 || h == 0 { return false; }
 
-    // Fast path: read CGImage pixels directly
-    // Fallback: render through a known-format bitmap context
-    let rgb = read_cgimage_rgb(&cg).or_else(|| render_cgimage_to_rgb(&cg))?;
+    // Fill rgb from CGImage pixels
+    if !read_cgimage_rgb(&cg, rgb) && !render_cgimage_to_rgb(&cg, rgb) { return false; }
 
-    // Scale if wider than limit — Nearest filter for speed
+    // Scale if wider than limit — Triangle filter
     let (fw, fh, data) = if w > max_w {
         let nh = (h * max_w) / w;
-        let img = image::RgbImage::from_raw(w, h, rgb)?;
-        let scaled = image::imageops::resize(&img, max_w, nh, image::imageops::FilterType::Triangle);
-        (max_w, nh, scaled.into_raw())
+        let img = match image::RgbImage::from_raw(w, h, std::mem::take(rgb)) {
+            Some(i) => i, None => return false,
+        };
+        let s = image::imageops::resize(&img, max_w, nh, image::imageops::FilterType::Triangle);
+        *scaled = s.into_raw();
+        (max_w, nh, scaled.as_slice())
     } else {
-        (w, h, rgb)
+        (w, h, rgb.as_slice())
     };
 
-    let mut buf = Vec::new();
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
-    enc.encode(&data, fw, fh, image::ExtendedColorType::Rgb8).ok()?;
-
-    if buf.len() > 500 { Some(buf) } else { None }
+    jpeg_out.clear();
+    {
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut *jpeg_out, quality);
+        if enc.encode(data, fw, fh, image::ExtendedColorType::Rgb8).is_err() { return false; }
+    }
+    jpeg_out.len() > 500
 }
 
 fn capture_cgimage(window_id: u32) -> Option<CGImage> {
@@ -63,11 +69,11 @@ fn capture_cgimage(window_id: u32) -> Option<CGImage> {
 }
 
 /// Read CGImage pixels directly and convert to packed RGB.
-fn read_cgimage_rgb(image: &CGImage) -> Option<Vec<u8>> {
+fn read_cgimage_rgb(image: &CGImage, out: &mut Vec<u8>) -> bool {
     let w = image.width();
     let h = image.height();
-    if w == 0 || h == 0 { return None; }
-    if image.bits_per_pixel() != 32 { return None; }
+    if w == 0 || h == 0 { return false; }
+    if image.bits_per_pixel() != 32 { return false; }
 
     let bpr = image.bytes_per_row();
     let raw_ptr = image.as_ptr() as *mut std::ffi::c_void;
@@ -76,9 +82,10 @@ fn read_cgimage_rgb(image: &CGImage) -> Option<Vec<u8>> {
 
     let cf_data = image.data();
     let raw: &[u8] = &cf_data;
-    if raw.len() < h.saturating_mul(bpr) { return None; }
+    if raw.len() < h.saturating_mul(bpr) { return false; }
 
-    let mut rgb = Vec::with_capacity(w * h * 3);
+    out.clear();
+    out.reserve(w * h * 3);
 
     match byte_order {
         // BGRA: bytes = [B, G, R, A] (most macOS systems)
@@ -86,9 +93,9 @@ fn read_cgimage_rgb(image: &CGImage) -> Option<Vec<u8>> {
             for row in 0..h {
                 let r = &raw[row * bpr..][..w * 4];
                 for px in r.chunks_exact(4) {
-                    rgb.push(px[2]);
-                    rgb.push(px[1]);
-                    rgb.push(px[0]);
+                    out.push(px[2]);
+                    out.push(px[1]);
+                    out.push(px[0]);
                 }
             }
         }
@@ -97,23 +104,23 @@ fn read_cgimage_rgb(image: &CGImage) -> Option<Vec<u8>> {
             for row in 0..h {
                 let r = &raw[row * bpr..][..w * 4];
                 for px in r.chunks_exact(4) {
-                    rgb.push(px[1]);
-                    rgb.push(px[2]);
-                    rgb.push(px[3]);
+                    out.push(px[1]);
+                    out.push(px[2]);
+                    out.push(px[3]);
                 }
             }
         }
-        _ => return None,
+        _ => return false,
     }
 
-    Some(rgb)
+    true
 }
 
 /// Fallback: render through a known-format bitmap context.
-fn render_cgimage_to_rgb(image: &CGImage) -> Option<Vec<u8>> {
+fn render_cgimage_to_rgb(image: &CGImage, out: &mut Vec<u8>) -> bool {
     let w = image.width();
     let h = image.height();
-    if w == 0 || h == 0 { return None; }
+    if w == 0 || h == 0 { return false; }
 
     let cs = CGColorSpace::create_device_rgb();
     let bpr = w * 4;
@@ -126,13 +133,14 @@ fn render_cgimage_to_rgb(image: &CGImage) -> Option<Vec<u8>> {
     ctx.draw_image(rect, image);
 
     let raw = ctx.data();
-    let mut rgb = Vec::with_capacity(w * h * 3);
+    out.clear();
+    out.reserve(w * h * 3);
     for px in raw.chunks_exact(4) {
-        rgb.push(px[1]);
-        rgb.push(px[2]);
-        rgb.push(px[3]);
+        out.push(px[1]);
+        out.push(px[2]);
+        out.push(px[3]);
     }
-    Some(rgb)
+    true
 }
 
 // ---------- window listing ----------
@@ -351,6 +359,9 @@ fn main() {
         c_cv.notify_all();
     }).ok();
 
+    let mut rgb_buf = Vec::new();
+    let mut scaled_buf = Vec::new();
+    let mut jpeg_buf = Vec::new();
     let mut fc: u64 = 0;
     let mut last = Instant::now();
     let mut fpc: u32 = 0;
@@ -358,7 +369,8 @@ fn main() {
     let mut next_capture = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
-        if let Some(jpeg) = capture_window(wid, max_w, quality) {
+        if capture_window(wid, max_w, quality, &mut rgb_buf, &mut scaled_buf, &mut jpeg_buf) {
+            let jpeg = std::mem::take(&mut jpeg_buf);
             *frame.lock().unwrap() = Arc::new(jpeg);
             frame_version.fetch_add(1, Ordering::Release);
             frame_signal.notify_all();
