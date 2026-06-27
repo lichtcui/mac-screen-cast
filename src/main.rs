@@ -6,6 +6,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
+
 use core_graphics::base::{kCGBitmapByteOrder32Big, kCGBitmapByteOrder32Little, kCGImageAlphaNoneSkipFirst};
 use core_graphics::color_space::CGColorSpace;
 use core_graphics::context::CGContext;
@@ -179,7 +181,7 @@ fn get_ip() -> String {
 
 // ---------- MJPEG stream ----------
 
-fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, version: Arc<AtomicU64>, signal: Arc<Condvar>, stop: Arc<AtomicBool>) {
+fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<ArcSwap<Vec<u8>>>, version: Arc<AtomicU64>, signal: Arc<(Mutex<()>, Condvar)>, stop: Arc<AtomicBool>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut buf = [0u8; 4096];
     if stream.read(&mut buf).is_err() { return; }
@@ -198,7 +200,7 @@ fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, v
         if stop.load(Ordering::Relaxed) { break; }
         let ver = version.load(Ordering::Acquire);
         if ver != last_version {
-            let jpeg = frame.lock().unwrap().clone();
+            let jpeg = frame.load_full();
             if !jpeg.is_empty() {
                 let part = format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", jpeg.len());
                 if stream.write_all(part.as_bytes()).is_err() { break; }
@@ -208,11 +210,12 @@ fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, v
                 last_version = ver;
             }
         } else {
-            let lock = frame.lock().unwrap();
+            let (mtx, cv) = &*signal;
+            let guard = mtx.lock().unwrap();
             if version.load(Ordering::Acquire) != last_version {
                 continue;
             }
-            let _ = signal.wait_timeout(lock, Duration::from_millis(500)).unwrap();
+            let _ = cv.wait_timeout(guard, Duration::from_millis(500)).unwrap();
         }
     }
 }
@@ -267,9 +270,9 @@ fn main() {
         if wid == 0 { return; }
     }
 
-    let frame: Arc<Mutex<Arc<Vec<u8>>>> = Arc::new(Mutex::new(Arc::new(Vec::new())));
+    let frame: Arc<ArcSwap<Vec<u8>>> = Arc::new(ArcSwap::from_pointee(Vec::new()));
     let frame_version = Arc::new(AtomicU64::new(0));
-    let frame_signal: Arc<Condvar> = Arc::new(Condvar::new());
+    let signal: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
     let stop = Arc::new(AtomicBool::new(false));
 
     let svr_f = frame.clone();
@@ -298,7 +301,7 @@ fn main() {
                 "/" => Response::from_data(html(&ip).into_bytes())
                     .with_header("Content-Type: text/html; charset=utf-8".parse::<Header>().unwrap()),
                 "/frame" => {
-                    let j = svr_f.lock().unwrap().clone();
+                    let j = svr_f.load_full();
                     if j.is_empty() { Response::from_data(Vec::new()).with_status_code(503) }
                     else {
                         Response::from_data(j.to_vec())
@@ -317,7 +320,7 @@ fn main() {
 
     let mjpeg_frame = frame.clone();
     let mjpeg_fv = frame_version.clone();
-    let mjpeg_cv = frame_signal.clone();
+    let mjpeg_sig = signal.clone();
     let mjpeg_stop = stop.clone();
 
     let mjpeg = thread::spawn(move || {
@@ -333,9 +336,9 @@ fn main() {
                     thread::spawn({
                         let f = mjpeg_frame.clone();
                         let v = mjpeg_fv.clone();
-                        let c = mjpeg_cv.clone();
+                        let sig = mjpeg_sig.clone();
                         let s = mjpeg_stop.clone();
-                        move || handle_mjpeg_client(stream, f, v, c, s)
+                        move || handle_mjpeg_client(stream, f, v, sig, s)
                     });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -347,7 +350,7 @@ fn main() {
     });
 
     let c_stop = stop.clone();
-    let c_cv = frame_signal.clone();
+    let c_sig = signal.clone();
     static CTRLC_COUNT: AtomicBool = AtomicBool::new(false);
     ctrlc::set_handler(move || {
         if CTRLC_COUNT.swap(true, Ordering::Relaxed) {
@@ -356,7 +359,7 @@ fn main() {
         }
         eprintln!("\n⏳ 正在停止 (再按一次 Ctrl+C 强制退出)...");
         c_stop.store(true, Ordering::Relaxed);
-        c_cv.notify_all();
+        c_sig.1.notify_all();
     }).ok();
 
     let mut rgb_buf = Vec::new();
@@ -371,9 +374,9 @@ fn main() {
     while !stop.load(Ordering::Relaxed) {
         if capture_window(wid, max_w, quality, &mut rgb_buf, &mut scaled_buf, &mut jpeg_buf) {
             let jpeg = std::mem::take(&mut jpeg_buf);
-            *frame.lock().unwrap() = Arc::new(jpeg);
+            frame.store(Arc::new(jpeg));
             frame_version.fetch_add(1, Ordering::Release);
-            frame_signal.notify_all();
+            signal.1.notify_all();
             fc += 1; fpc += 1;
         }
         let now = Instant::now();
