@@ -172,7 +172,7 @@ for x in w { if let n = x[kCGWindowName as String] as? String, !n.isEmpty,
 // ---------- HTTP ----------
 
 fn html(ip: &str) -> String {
-    format!(r#"<!DOCTYPE html><html><meta charset="utf-8"><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>ScreenStream</title><style>*{{margin:0;background:#000}}body{{display:flex;min-height:100dvh;align-items:center;justify-content:center}}img{{width:100%;max-height:100dvh;object-fit:contain}}#b{{position:fixed;bottom:0;left:0;right:0;display:flex;gap:12px;padding:3px 10px;background:rgba(0,0,0,.5);color:#aaa;font:11px/1.3 monospace;z-index:99}}.g{{color:#4a4}}.r{{color:#c44}}</style><body><img id=s src="http://{ip}:8081/stream"><div id=b><span id=st class=g>streaming</span></div>"#)
+    format!(r#"<!DOCTYPE html><html><meta charset="utf-8"><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>ScreenStream</title><style>*{{margin:0;background:#000}}body{{display:flex;min-height:100dvh;align-items:center;justify-content:center}}img{{width:100%;max-height:100dvh;object-fit:contain}}#b{{position:fixed;bottom:0;left:0;right:0;display:flex;gap:12px;padding:3px 10px;background:rgba(0,0,0,.5);color:#aaa;font:11px/1.3 monospace;z-index:99}}.g{{color:#4a4}}.r{{color:#c44}}</style><body><img id=s src="http://{ip}:8081/stream"><div id=b><span id=st class=g>streaming</span></div><script>document.getElementById('s').onerror=function(){{var s=document.getElementById('st');s.textContent='reconnecting';s.className='r';var i=this;setTimeout(function(){{i.src='http://{ip}:8081/stream?'+Date.now()}},2000)}}</script>"#)
 }
 
 fn get_ip() -> String {
