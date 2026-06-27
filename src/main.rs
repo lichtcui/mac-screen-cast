@@ -184,7 +184,7 @@ fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<ArcSwap<Vec<u8>>>, vers
 
     let _ = stream.set_nodelay(true);
     let header = "HTTP/1.1 200 OK\r\n\
-                  Content-Type: multipart/x-mixed-replace; boundary=--frame\r\n\
+                  Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\
                   Cache-Control: no-cache\r\n\
                   Connection: close\r\n\r\n";
     if stream.write_all(header.as_bytes()).is_err() { return; }
