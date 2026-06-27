@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -173,7 +173,7 @@ fn get_ip() -> String {
 
 // ---------- MJPEG stream ----------
 
-fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, stop: Arc<AtomicBool>) {
+fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, version: Arc<AtomicU64>, stop: Arc<AtomicBool>) {
     let mut buf = [0u8; 4096];
     if stream.read(&mut buf).is_err() { return; }
     let req = String::from_utf8_lossy(&buf);
@@ -186,17 +186,20 @@ fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, s
                   Connection: close\r\n\r\n";
     if stream.write_all(header.as_bytes()).is_err() { return; }
 
-    let mut last_len = 0usize;
+    let mut last_version = 0u64;
     loop {
         if stop.load(Ordering::Relaxed) { break; }
-        let jpeg = frame.lock().unwrap().clone();
-        if !jpeg.is_empty() && jpeg.len() != last_len {
-            let part = format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", jpeg.len());
-            if stream.write_all(part.as_bytes()).is_err() { break; }
-            if stream.write_all(&jpeg).is_err() { break; }
-            if stream.write_all(b"\r\n").is_err() { break; }
-            let _ = stream.flush();
-            last_len = jpeg.len();
+        let ver = version.load(Ordering::Acquire);
+        if ver != last_version {
+            let jpeg = frame.lock().unwrap().clone();
+            if !jpeg.is_empty() {
+                let part = format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", jpeg.len());
+                if stream.write_all(part.as_bytes()).is_err() { break; }
+                if stream.write_all(&jpeg).is_err() { break; }
+                if stream.write_all(b"\r\n").is_err() { break; }
+                let _ = stream.flush();
+                last_version = ver;
+            }
         } else {
             thread::sleep(Duration::from_millis(16));
         }
@@ -248,6 +251,7 @@ fn main() {
     }
 
     let frame: Arc<Mutex<Arc<Vec<u8>>>> = Arc::new(Mutex::new(Arc::new(Vec::new())));
+    let frame_version = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
 
     let svr_f = frame.clone();
@@ -294,6 +298,7 @@ fn main() {
     });
 
     let mjpeg_frame = frame.clone();
+    let mjpeg_fv = frame_version.clone();
     let mjpeg_stop = stop.clone();
 
     let mjpeg = thread::spawn(move || {
@@ -308,8 +313,9 @@ fn main() {
                 Ok((stream, _)) => {
                     thread::spawn({
                         let f = mjpeg_frame.clone();
+                        let v = mjpeg_fv.clone();
                         let s = mjpeg_stop.clone();
-                        move || handle_mjpeg_client(stream, f, s)
+                        move || handle_mjpeg_client(stream, f, v, s)
                     });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -338,6 +344,7 @@ fn main() {
     while !stop.load(Ordering::Relaxed) {
         if let Some(jpeg) = capture_window(wid) {
             *frame.lock().unwrap() = Arc::new(jpeg);
+            frame_version.fetch_add(1, Ordering::Release);
             fc += 1; fpc += 1;
         }
         if last.elapsed() >= Duration::from_secs(5) {
