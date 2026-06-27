@@ -173,7 +173,7 @@ fn get_ip() -> String {
 
 // ---------- MJPEG stream ----------
 
-fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Vec<u8>>>, stop: Arc<AtomicBool>) {
+fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, stop: Arc<AtomicBool>) {
     let mut buf = [0u8; 4096];
     if stream.read(&mut buf).is_err() { return; }
     let req = String::from_utf8_lossy(&buf);
@@ -247,7 +247,7 @@ fn main() {
         if wid == 0 { return; }
     }
 
-    let frame: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let frame: Arc<Mutex<Arc<Vec<u8>>>> = Arc::new(Mutex::new(Arc::new(Vec::new())));
     let stop = Arc::new(AtomicBool::new(false));
 
     let svr_f = frame.clone();
@@ -279,7 +279,7 @@ fn main() {
                     let j = svr_f.lock().unwrap().clone();
                     if j.is_empty() { Response::from_data(Vec::new()).with_status_code(503) }
                     else {
-                        Response::from_data(j)
+                        Response::from_data(j.to_vec())
                             .with_header("Content-Type: image/jpeg".parse::<Header>().unwrap())
                             .with_header("Cache-Control: no-cache, no-store, must-revalidate".parse::<Header>().unwrap())
                             .with_header("Pragma: no-cache".parse::<Header>().unwrap())
@@ -337,7 +337,7 @@ fn main() {
 
     while !stop.load(Ordering::Relaxed) {
         if let Some(jpeg) = capture_window(wid) {
-            *frame.lock().unwrap() = jpeg;
+            *frame.lock().unwrap() = Arc::new(jpeg);
             fc += 1; fpc += 1;
         }
         if last.elapsed() >= Duration::from_secs(5) {
