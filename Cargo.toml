@@ -10,8 +10,8 @@ core-graphics = "0.25"
 core-foundation = "0.10"
 foreign-types = "0.5"
 arc-swap = "1"
-threadpool = "1"
 
 [profile.release]
-opt-level = 2
+opt-level = 3
 lto = true
+strip = true
