@@ -162,7 +162,9 @@ for x in w { if let n = x[kCGWindowName as String] as? String, !n.isEmpty,
 
 // ---------- HTTP ----------
 
-const HTML: &str = r#"<!DOCTYPE html><html><meta charset="utf-8"><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>ScreenStream</title><style>*{margin:0;background:#000}body{display:flex;min-height:100dvh;align-items:center;justify-content:center}img{width:100%;max-height:100dvh;object-fit:contain}#b{position:fixed;bottom:0;left:0;right:0;display:flex;gap:12px;padding:3px 10px;background:rgba(0,0,0,.5);color:#aaa;font:11px/1.3 monospace;z-index:99}.g{color:#4a4}.r{color:#c44}</style><body><img id=s><div id=b><span id=st class=r>init</span><span id=fs>--</span><span id=sz>--</span><span id=ms>--</span></div><script>(function(){var i=document.getElementById('s'),st=document.getElementById('st'),fs=document.getElementById('fs'),sz=document.getElementById('sz'),ms=document.getElementById('ms'),fc=0,t0=Date.now();function u(){var t1=performance.now();i.src='/frame?'+Math.random();i.onload=function(){fc++;ms.textContent=(performance.now()-t1).toFixed(0)+'ms';st.textContent='live';st.className='g';sz.textContent=i.naturalWidth+'x'+i.naturalHeight;fs.textContent=(fc/((Date.now()-t0)/1000)).toFixed(1)+'fps';setTimeout(u,50)};i.onerror=function(){st.textContent='err';st.className='r';setTimeout(u,200)}};setTimeout(u,200)})()</script>"#;
+fn html(ip: &str) -> String {
+    format!(r#"<!DOCTYPE html><html><meta charset="utf-8"><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>ScreenStream</title><style>*{{margin:0;background:#000}}body{{display:flex;min-height:100dvh;align-items:center;justify-content:center}}img{{width:100%;max-height:100dvh;object-fit:contain}}#b{{position:fixed;bottom:0;left:0;right:0;display:flex;gap:12px;padding:3px 10px;background:rgba(0,0,0,.5);color:#aaa;font:11px/1.3 monospace;z-index:99}}.g{{color:#4a4}}.r{{color:#c44}}</style><body><img id=s src="http://{ip}:8081/stream"><div id=b><span id=st class=g>streaming</span></div>"#)
+}
 
 fn get_ip() -> String {
     Command::new("sh").arg("-c").arg("ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1")
@@ -271,7 +273,7 @@ fn main() {
             };
             let path = req.url().split('?').next().unwrap_or("/").to_string();
             let resp = match path.as_str() {
-                "/" => Response::from_data(HTML.as_bytes().to_vec())
+                "/" => Response::from_data(html(&ip).into_bytes())
                     .with_header("Content-Type: text/html; charset=utf-8".parse::<Header>().unwrap()),
                 "/frame" => {
                     let j = svr_f.lock().unwrap().clone();
