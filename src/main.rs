@@ -173,7 +173,7 @@ fn get_ip() -> String {
 
 // ---------- MJPEG stream ----------
 
-fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, version: Arc<AtomicU64>, signal: Arc<(Mutex<bool>, Condvar)>, stop: Arc<AtomicBool>) {
+fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, version: Arc<AtomicU64>, signal: Arc<Condvar>, stop: Arc<AtomicBool>) {
     let mut buf = [0u8; 4096];
     if stream.read(&mut buf).is_err() { return; }
     let req = String::from_utf8_lossy(&buf);
@@ -201,12 +201,11 @@ fn handle_mjpeg_client(mut stream: TcpStream, frame: Arc<Mutex<Arc<Vec<u8>>>>, v
                 last_version = ver;
             }
         } else {
-            let (lock, cv) = &*signal;
-            let mut f = lock.lock().unwrap();
-            while !*f {
-                f = cv.wait(f).unwrap();
+            let lock = frame.lock().unwrap();
+            if version.load(Ordering::Acquire) != last_version {
+                continue;
             }
-            *f = false;
+            let _ = signal.wait_timeout(lock, Duration::from_millis(500)).unwrap();
         }
     }
 }
@@ -257,7 +256,7 @@ fn main() {
 
     let frame: Arc<Mutex<Arc<Vec<u8>>>> = Arc::new(Mutex::new(Arc::new(Vec::new())));
     let frame_version = Arc::new(AtomicU64::new(0));
-    let frame_signal: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
+    let frame_signal: Arc<Condvar> = Arc::new(Condvar::new());
     let stop = Arc::new(AtomicBool::new(false));
 
     let svr_f = frame.clone();
@@ -355,8 +354,7 @@ fn main() {
         if let Some(jpeg) = capture_window(wid) {
             *frame.lock().unwrap() = Arc::new(jpeg);
             frame_version.fetch_add(1, Ordering::Release);
-            *frame_signal.0.lock().unwrap() = true;
-            frame_signal.1.notify_all();
+            frame_signal.notify_all();
             fc += 1; fpc += 1;
         }
         let now = Instant::now();
