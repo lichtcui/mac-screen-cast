@@ -36,7 +36,7 @@ fn capture_window(window_id: u32, max_w: u32, quality: u8) -> Option<Vec<u8>> {
     let (fw, fh, data) = if w > max_w {
         let nh = (h * max_w) / w;
         let img = image::RgbImage::from_raw(w, h, rgb)?;
-        let scaled = image::imageops::resize(&img, max_w, nh, image::imageops::FilterType::Nearest);
+        let scaled = image::imageops::resize(&img, max_w, nh, image::imageops::FilterType::Triangle);
         (max_w, nh, scaled.into_raw())
     } else {
         (w, h, rgb)
