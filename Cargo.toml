@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 tiny_http = "0.12"
 ctrlc = "3.4"
+core-graphics = "0.25"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+foreign-types = "0.5"
 
 [profile.release]
 opt-level = 2

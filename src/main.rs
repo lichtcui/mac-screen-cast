@@ -5,20 +5,135 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-// ---------- CGWindowListCreateImage via dlsym ----------
+use core_graphics::base::{kCGBitmapByteOrder32Big, kCGBitmapByteOrder32Little, kCGImageAlphaNoneSkipFirst};
+use core_graphics::color_space::CGColorSpace;
+use core_graphics::context::CGContext;
+use core_graphics::geometry::{CGRect, CGPoint, CGSize};
+use core_graphics::image::CGImage;
+use core_graphics::window;
+use foreign_types::ForeignType;
+
+// ---------- pixel-format introspection ----------
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGImageGetBitmapInfo(image: *mut std::ffi::c_void) -> u32;
+}
+
+// ---------- Core Graphics window capture ----------
 
 fn capture_window(window_id: u32) -> Option<Vec<u8>> {
-    let tmp = format!("/tmp/sc{}.jpg", window_id);
-    Command::new("screencapture")
-        .args(["-l", &window_id.to_string(), "-x", &tmp])
-        .output().ok()?;
-    // Scale to max 1280px wide (phone-friendly), sips is macOS built-in
-    Command::new("sips")
-        .args(["-Z", "1280", &tmp, "--out", &tmp])
-        .output().ok()?;
-    let data = std::fs::read(&tmp).ok()?;
-    let _ = std::fs::remove_file(&tmp);
-    if data.len() > 500 { Some(data) } else { None }
+    const MAX_W: u32 = 1280;
+    const Q: u8 = 70;
+
+    let cg = capture_cgimage(window_id)?;
+    let (w, h) = (cg.width() as u32, cg.height() as u32);
+    if w == 0 || h == 0 { return None; }
+
+    // Fast path: read CGImage pixels directly
+    // Fallback: render through a known-format bitmap context
+    let rgb = read_cgimage_rgb(&cg).or_else(|| render_cgimage_to_rgb(&cg))?;
+
+    // Scale if wider than limit — Nearest filter for speed
+    let (fw, fh, data) = if w > MAX_W {
+        let nh = (h * MAX_W) / w;
+        let img = image::RgbImage::from_raw(w, h, rgb)?;
+        let scaled = image::imageops::resize(&img, MAX_W, nh, image::imageops::FilterType::Nearest);
+        (MAX_W, nh, scaled.into_raw())
+    } else {
+        (w, h, rgb)
+    };
+
+    let mut buf = Vec::new();
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, Q);
+    enc.encode(&data, fw, fh, image::ExtendedColorType::Rgb8).ok()?;
+
+    if buf.len() > 500 { Some(buf) } else { None }
+}
+
+fn capture_cgimage(window_id: u32) -> Option<CGImage> {
+    let null_rect = CGRect::new(
+        &CGPoint::new(f64::INFINITY, f64::INFINITY),
+        &CGSize::new(0.0, 0.0),
+    );
+    window::create_image(
+        null_rect,
+        window::kCGWindowListOptionIncludingWindow,
+        window_id,
+        window::kCGWindowImageDefault | window::kCGWindowImageNominalResolution,
+    )
+}
+
+/// Read CGImage pixels directly and convert to packed RGB.
+fn read_cgimage_rgb(image: &CGImage) -> Option<Vec<u8>> {
+    let w = image.width();
+    let h = image.height();
+    if w == 0 || h == 0 { return None; }
+    if image.bits_per_pixel() != 32 { return None; }
+
+    let bpr = image.bytes_per_row();
+    let raw_ptr = image.as_ptr() as *mut std::ffi::c_void;
+    let bitmap_info = unsafe { CGImageGetBitmapInfo(raw_ptr) };
+    let byte_order = bitmap_info & 0x7000;
+
+    let cf_data = image.data();
+    let raw: &[u8] = &cf_data;
+    if raw.len() < h.saturating_mul(bpr) { return None; }
+
+    let mut rgb = Vec::with_capacity(w * h * 3);
+
+    match byte_order {
+        // BGRA: bytes = [B, G, R, A] (most macOS systems)
+        a if a == kCGBitmapByteOrder32Little => {
+            for row in 0..h {
+                let r = &raw[row * bpr..][..w * 4];
+                for px in r.chunks_exact(4) {
+                    rgb.push(px[2]);
+                    rgb.push(px[1]);
+                    rgb.push(px[0]);
+                }
+            }
+        }
+        // XRGB big-endian: bytes = [X, R, G, B]
+        a if a == kCGBitmapByteOrder32Big => {
+            for row in 0..h {
+                let r = &raw[row * bpr..][..w * 4];
+                for px in r.chunks_exact(4) {
+                    rgb.push(px[1]);
+                    rgb.push(px[2]);
+                    rgb.push(px[3]);
+                }
+            }
+        }
+        _ => return None,
+    }
+
+    Some(rgb)
+}
+
+/// Fallback: render through a known-format bitmap context.
+fn render_cgimage_to_rgb(image: &CGImage) -> Option<Vec<u8>> {
+    let w = image.width();
+    let h = image.height();
+    if w == 0 || h == 0 { return None; }
+
+    let cs = CGColorSpace::create_device_rgb();
+    let bpr = w * 4;
+    let mut ctx = CGContext::create_bitmap_context(
+        None, w, h, 8, bpr, &cs,
+        kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipFirst,
+    );
+
+    let rect = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(w as _, h as _));
+    ctx.draw_image(rect, image);
+
+    let raw = ctx.data();
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for px in raw.chunks_exact(4) {
+        rgb.push(px[1]);
+        rgb.push(px[2]);
+        rgb.push(px[3]);
+    }
+    Some(rgb)
 }
 
 // ---------- window listing ----------
@@ -97,11 +212,9 @@ fn main() {
         if wid == 0 { return; }
     }
 
-    // Shared state
     let frame: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
 
-    // HTTP server thread
     let svr_f = frame.clone();
     let svr_s = stop.clone();
     let svr_w = wid;
@@ -144,7 +257,6 @@ fn main() {
         }
     });
 
-    // Ctrl+C — first press sets stop flag, second press force-exits
     let c_stop = stop.clone();
     static CTRLC_COUNT: AtomicBool = AtomicBool::new(false);
     ctrlc::set_handler(move || {
@@ -156,7 +268,6 @@ fn main() {
         c_stop.store(true, Ordering::Relaxed);
     }).ok();
 
-    // Capture loop (main thread)
     let mut fc: u64 = 0;
     let mut last = Instant::now();
     let mut fpc: u32 = 0;
@@ -166,7 +277,6 @@ fn main() {
             *frame.lock().unwrap() = jpeg;
             fc += 1; fpc += 1;
         }
-        // No artificial sleep — let CGWindowListCreateImage be the rate limiter
         if last.elapsed() >= Duration::from_secs(5) {
             let fps = fpc as f64 / last.elapsed().as_secs_f64();
             eprintln!("  {:4.0} fps | {} frames", fps, fc);
