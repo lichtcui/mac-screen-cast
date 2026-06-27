@@ -433,7 +433,13 @@ unsafe extern "C" fn encode_callback(
     if copy_status != 0 { return; }
 
     let pts = CMSampleBufferGetPresentationTimeStamp(sample_buffer);
-    let is_keyframe = sps.is_some();
+
+    // Determine if this is a keyframe by checking the first NAL unit type
+    let is_keyframe = if len > 5 {
+        (data[4] & 0x1f) == 5 // NAL unit type 5 = IDR
+    } else {
+        false
+    };
 
     let frame = H264Frame {
         data,
@@ -466,12 +472,12 @@ struct Fmp4State {
     height: u32,
     timescale: u32,
     sequence_number: u32,
-    base_time: u64,
+    dts_counter: u64, // local DTS starting from 0
 }
 
 impl Fmp4State {
     fn new(sps: Vec<u8>, pps: Vec<u8>, width: u32, height: u32, timescale: u32) -> Self {
-        Fmp4State { sps, pps, width, height, timescale, sequence_number: 1, base_time: 0 }
+        Fmp4State { sps, pps, width, height, timescale, sequence_number: 1, dts_counter: 0 }
     }
 
     fn codecs_string(&self) -> String {
@@ -697,20 +703,14 @@ impl Fmp4State {
     }
 
     // Build a media segment (moof + mdat) for a single video sample
-    fn build_media_segment(&mut self, data: &[u8], is_keyframe: bool, pts_tscale: i32, pts_val: i64) -> Vec<u8> {
+    fn build_media_segment(&mut self, data: &[u8], is_keyframe: bool, _pts_tscale: i32, _pts_val: i64) -> Vec<u8> {
         let seq = self.sequence_number;
         self.sequence_number += 1;
 
-        // Convert PTS to our timescale. VT uses its own timescale (set during encoding).
-        // We convert to base_time domain.
-        let pts_90k = if pts_tscale > 0 {
-            (pts_val as f64 * self.timescale as f64 / pts_tscale as f64) as u64
-        } else {
-            self.base_time + (self.timescale as u64 / 30) // fallback
-        };
-
-        // For no-B-frame encoding, DTS = PTS
-        let dts = pts_90k;
+        // Use local DTS counter starting at 0 (not VT's absolute timestamps)
+        let dts = self.dts_counter;
+        let frame_ticks = self.timescale as u64 / 30; // 3000 for 30fps @ 90kHz
+        self.dts_counter += frame_ticks;
         let cto = 0i32; // composition time offset = 0
 
         // Build moof
