@@ -1,2 +1,6 @@
-[net]
-git-fetch-with-cli = true
+# screencapturekit depends on Swift runtime at /usr/lib/swift/
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-args=-Wl,-rpath,/usr/lib/swift"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-args=-Wl,-rpath,/usr/lib/swift"]

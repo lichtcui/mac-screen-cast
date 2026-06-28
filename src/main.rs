@@ -1,19 +1,16 @@
 mod capture;
-mod fmp4;
 mod h264;
 mod server;
 mod webrtc;
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use core_graphics::base::{kCGBitmapByteOrder32Big, kCGImageAlphaNoneSkipFirst};
-use core_graphics::color_space::CGColorSpace;
-use core_graphics::context::{CGContext, CGInterpolationQuality};
-use core_graphics::geometry::{CGRect, CGPoint, CGSize};
+use screencapturekit::cm::CMSampleBuffer;
+use screencapturekit::prelude::*;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -25,10 +22,22 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "-w" | "--window-id" => { i += 1; wid = args[i].parse().unwrap_or(0); }
-            "--width" => { i += 1; max_w = args[i].parse().unwrap_or(1280); }
-            "--fps" => { i += 1; fps = args[i].parse().unwrap_or(30).clamp(1, 60); }
-            "--port" => { i += 1; port = args[i].parse().unwrap_or(8080); }
+            "-w" | "--window-id" => {
+                i += 1;
+                wid = args[i].parse().unwrap_or(0);
+            }
+            "--width" => {
+                i += 1;
+                max_w = args[i].parse().unwrap_or(1280);
+            }
+            "--fps" => {
+                i += 1;
+                fps = args[i].parse().unwrap_or(30).clamp(1, 60);
+            }
+            "--port" => {
+                i += 1;
+                port = args[i].parse().unwrap_or(8080);
+            }
             "-l" | "--list" => {
                 for (id, app, title) in server::list_windows() {
                     println!("{:>5} | {} | {}", id, app, title);
@@ -46,70 +55,163 @@ fn main() {
 
     if wid == 0 {
         let wins = server::list_windows();
-        if wins.is_empty() { eprintln!("无窗口"); return; }
+        if wins.is_empty() {
+            eprintln!("No windows found");
+            return;
+        }
         let mut seen = std::collections::HashSet::new();
         let mut uq = Vec::new();
-        for w in &wins { if seen.insert((&w.1, &w.2)) { uq.push(w); } }
-        for (j, (_, a, t)) in uq.iter().enumerate() {
-            println!("  [{:2}] {} - {}", j + 1, a, if t.len()>55{&t[..55]}else{t});
+        for w in &wins {
+            if seen.insert((&w.1, &w.2)) {
+                uq.push(w);
+            }
         }
-        print!("选择窗口 (1-{}): ", uq.len());
+        for (j, (_, a, t)) in uq.iter().enumerate() {
+            println!(
+                "  [{:2}] {} - {}",
+                j + 1,
+                a,
+                if t.len() > 55 { &t[..55] } else { t }
+            );
+        }
+        print!("Select window (1-{}): ", uq.len());
         std::io::stdout().flush().ok();
         let mut s = String::new();
         std::io::stdin().read_line(&mut s).ok();
         if let Ok(n) = s.trim().parse::<usize>() {
-            if n >= 1 && n <= uq.len() { wid = uq[n-1].0; }
+            if n >= 1 && n <= uq.len() {
+                wid = uq[n - 1].0;
+            }
         }
-        if wid == 0 { return; }
+        if wid == 0 {
+            return;
+        }
     }
 
-    let stop = Arc::new(AtomicBool::new(false));
+    // ── Initialize CoreGraphics (required for SCKit before macOS 26+?) ──
+    // The screencapturekit crate provides this FFI function to prevent
+    // CGS_REQUIRE_INIT assertion failures in command-line tools.
+    unsafe { screencapturekit::ffi::sc_initialize_core_graphics() }
 
+    // ── Compute output dimensions via SCShareableContent ──
+    let (out_w, out_h) = {
+        let content = SCShareableContent::get().unwrap_or_else(|e| {
+            eprintln!("ScreenCaptureKit error: {e}");
+            eprintln!(
+                "Grant Screen Recording permission in \
+                 System Settings > Privacy & Security > Screen Recording."
+            );
+            std::process::exit(1);
+        });
+        let windows = content.windows();
+        let window = windows
+            .iter()
+            .find(|w| w.window_id() == wid)
+            .unwrap_or_else(|| {
+                eprintln!("Window {wid} not found — try --list to see available windows.");
+                std::process::exit(1);
+            });
+        let frame = window.frame();
+        let nw = frame.size().width as u32;
+        let nh = frame.size().height as u32;
+
+        let (ow, oh) = if nw > max_w {
+            let rnh = (nh * max_w) / nw;
+            (max_w, rnh)
+        } else {
+            (nw, nh)
+        };
+        (ow & !1, oh & !1)
+    };
+
+    eprintln!(
+        "  Capture {}x{} @ {}fps, output to :{}",
+        out_w, out_h, fps, port
+    );
+
+    // ── Init H.264 encoder ──
+    let encoder = match h264::VtEncoder::new(out_w, out_h, fps) {
+        Ok(e) => Arc::new(e),
+        Err(e) => {
+            eprintln!("Encoder init failed: {e}");
+            return;
+        }
+    };
+
+    // ── Channel: encoded frames → WebRTC sender ──
+    let (frame_tx, frame_rx) = mpsc::channel::<h264::H264Frame>();
+
+    // ── Stop flag ──
+    let stop = Arc::new(AtomicBool::new(false));
+    static CTRLC_COUNT: AtomicBool = AtomicBool::new(false);
+    {
+        let c_stop = stop.clone();
+        ctrlc::set_handler(move || {
+            if CTRLC_COUNT.swap(true, Ordering::Relaxed) {
+                eprintln!("\nForce exit");
+                std::process::exit(1);
+            }
+            eprintln!("\nStopping (Ctrl+C again to force)...");
+            c_stop.store(true, Ordering::Relaxed);
+        })
+        .ok();
+    }
+
+    // ── WebRTC ──
     let wr_handle: Arc<Mutex<Option<webrtc::WebRtcHandle>>> = Arc::new(Mutex::new(None));
     let webrtc_connected = Arc::new(AtomicBool::new(false));
-    let svr_s = stop.clone();
-    let svr_port = port;
-    let ip = server::get_ip();
-
     let srv_wr = wr_handle.clone();
     let srv_wr_conn = webrtc_connected.clone();
+    let svr_s = stop.clone();
+    let ip = server::get_ip();
 
     let srv = thread::spawn(move || {
         use tiny_http::{Header, Response};
-        let server = match tiny_http::Server::http(format!("0.0.0.0:{}", svr_port)) {
+        let server = match tiny_http::Server::http(format!("0.0.0.0:{}", port)) {
             Ok(s) => s,
-            Err(e) => { eprintln!("端口 {} 被占用: {}", svr_port, e); return; }
+            Err(e) => {
+                eprintln!("Port {} in use: {}", port, e);
+                return;
+            }
         };
-        eprintln!("\n  WebRTC stream →  http://{}:{}", ip, svr_port);
+        eprintln!("\n  WebRTC stream →  http://{}:{}", ip, port);
 
         loop {
-            if svr_s.load(Ordering::Relaxed) { break; }
+            if svr_s.load(Ordering::Relaxed) {
+                break;
+            }
             let mut req = match server.recv_timeout(Duration::from_millis(500)) {
-                Ok(Some(r)) => r, _ => continue,
+                Ok(Some(r)) => r,
+                _ => continue,
             };
             let url = req.url();
             let path = url.split('?').next().unwrap_or("/");
 
             let resp = match path {
                 "/" => Response::from_data(server::html(fps).into_bytes())
-                    .with_header("Content-Type: text/html; charset=utf-8".parse::<Header>().unwrap()),
+                    .with_header(
+                        "Content-Type: text/html; charset=utf-8"
+                            .parse::<Header>()
+                            .unwrap(),
+                    ),
                 "/offer" => {
-                    // If the offer has been consumed by a previous signal, recreate
                     if srv_wr_conn.load(Ordering::Relaxed) {
-                        // Close old connection
                         if let Some(ref wr) = *srv_wr.lock().unwrap() {
                             wr.close();
                         }
                         srv_wr_conn.store(false, Ordering::Relaxed);
-                        // Create fresh handle (blocks ~3s for ICE gathering)
                         if let Ok(new_handle) = webrtc::WebRtcHandle::new(svr_s.clone()) {
-                            *srv_wr.lock().unwrap() = Some(new_handle);
                             eprintln!("  WebRTC offer recreated");
+                            *srv_wr.lock().unwrap() = Some(new_handle);
                         }
                     }
                     match srv_wr.lock().unwrap().as_ref() {
                         Some(wr) => Response::from_data(wr.offer.clone().into_bytes())
-                            .with_header("Content-Type: application/sdp".parse::<Header>().unwrap()),
+                            .with_header(
+                                "Content-Type: application/sdp"
+                                    .parse::<Header>()
+                                    .unwrap(),
+                            ),
                         None => Response::from_data(Vec::from("not ready")).with_status_code(503),
                     }
                 }
@@ -124,9 +226,15 @@ fn main() {
                                         for c in cands {
                                             let cs = c["candidate"].as_str().unwrap_or("");
                                             if !cs.is_empty() {
-                                                let sdp_mid = c["sdpMid"].as_str().map(|s| s.to_string());
-                                                let sdp_mline_index = c["sdpMLineIndex"].as_u64().map(|n| n as u16);
-                                                let _ = wr.add_candidate(cs, sdp_mid, sdp_mline_index);
+                                                let sdp_mid =
+                                                    c["sdpMid"].as_str().map(|s| s.to_string());
+                                                let sdp_mline_index =
+                                                    c["sdpMLineIndex"].as_u64().map(|n| n as u16);
+                                                let _ = wr.add_candidate(
+                                                    cs,
+                                                    sdp_mid,
+                                                    sdp_mline_index,
+                                                );
                                             }
                                         }
                                     }
@@ -144,49 +252,7 @@ fn main() {
         }
     });
 
-    let c_stop = stop.clone();
-    static CTRLC_COUNT: AtomicBool = AtomicBool::new(false);
-    ctrlc::set_handler(move || {
-        if CTRLC_COUNT.swap(true, Ordering::Relaxed) {
-            eprintln!("\n强制退出");
-            std::process::exit(1);
-        }
-        eprintln!("\n⏳ 正在停止 (再按一次 Ctrl+C 强制退出)...");
-        c_stop.store(true, Ordering::Relaxed);
-    }).ok();
-
-    let frame_dur = Duration::from_secs_f64(1.0 / fps as f64);
-    let mut next_capture = Instant::now();
-
-    // Determine capture dimensions from a test capture
-    let (enc_w, enc_h) = match capture::capture_cgimage(wid) {
-        Some(cg) => {
-            let w = cg.width() as u32;
-            let h = cg.height() as u32;
-            if w > 0 && h > 0 {
-                if w > max_w {
-                    let nh = (h * max_w) / w;
-                    // ensure even dimensions (VideoToolbox requirement)
-                    (max_w | 1, nh | 1)
-                } else {
-                    (w | 1, h | 1)
-                }
-            } else {
-                (max_w, max_w * 9 / 16)
-            }
-        }
-        None => (max_w, max_w * 9 / 16),
-    };
-    let (enc_w, enc_h) = (enc_w & !1, enc_h & !1); // round down to even for encoder
-
-    let mut h264_encoder: Option<h264::VtEncoder> = h264::VtEncoder::new(enc_w, enc_h, fps).ok();
-    let mut h264_frame_count: u64 = 0;
-    let mut scaler_ctx: Option<(CGContext, u32, u32)> = None;
-
-    let mut last_report = Instant::now();
-
-
-    // Initialize WebRTC (blocks until offer is generated)
+    // ── Init WebRTC (blocks ~3s for ICE gathering) ──
     {
         eprintln!("  Initializing WebRTC...");
         let wstop = stop.clone();
@@ -199,80 +265,81 @@ fn main() {
         }
     }
 
+    // ── Start ScreenCaptureKit capture ──
+    let encoder_cb = encoder.clone();
+    let frame_tx_cb = frame_tx.clone();
+    let frame_count = Arc::new(AtomicU64::new(0));
+    let frame_count_cb = frame_count.clone();
+
+    let mut capture_session = match capture::CaptureSession::new(
+        wid,
+        out_w,
+        out_h,
+        fps,
+        move |sample: CMSampleBuffer, _type: SCStreamOutputType| {
+            let n = frame_count_cb.fetch_add(1, Ordering::Relaxed);
+            if let Some(pb) = sample.image_buffer() {
+                match encoder_cb.encode_pixelbuffer(
+                    pb.as_ptr(),
+                    pb.width() as u32,
+                    pb.height() as u32,
+                    n,
+                    fps as i32,
+                ) {
+                    Ok(frame) => {
+                        let _ = frame_tx_cb.send(frame);
+                    }
+                    Err(e) => {
+                        eprintln!("  Encode error: {}", e);
+                    }
+                }
+            }
+        },
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return;
+        }
+    };
+
+    // ── Main loop: receive encoded frames → WebRTC ──
+    let mut h264_frame_count: u64 = 0;
+    let mut last_report = Instant::now();
+    let mut last_frame = Instant::now();
+
     while !stop.load(Ordering::Relaxed) {
-        // Recover dead encoder
-        if h264_encoder.is_none() {
-            h264_encoder = h264::VtEncoder::new(enc_w, enc_h, fps).ok();
-        }
+        match frame_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(frame) => {
+                h264_frame_count += 1;
+                last_frame = Instant::now();
 
-        // Capture and optionally scale using cached context
-        let shared_cg = match capture::capture_cgimage(wid) {
-            None => None,
-            Some(cg) => {
-                let (w, h) = (cg.width() as u32, cg.height() as u32);
-                if w == 0 || h == 0 { None }
-                else if w > max_w {
-                    let nh = (h * max_w) / w;
-                    if !matches!(scaler_ctx, Some((_, tw, th)) if tw == max_w && th == nh) {
-                        let cs = CGColorSpace::create_device_rgb();
-                        let ctx = CGContext::create_bitmap_context(
-                            None, max_w as usize, nh as usize, 8, max_w as usize * 4, &cs,
-                            kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipFirst,
-                        );
-                        ctx.set_interpolation_quality(CGInterpolationQuality::CGInterpolationQualityHigh);
-                        scaler_ctx = Some((ctx, max_w, nh));
+                if let Some(ref wr) = *wr_handle.lock().unwrap() {
+                    if let Err(e) = wr.send_frame(&frame) {
+                        eprintln!("  WebRTC send error: {}", e);
                     }
-                    let (ref ctx, _, _) = scaler_ctx.as_ref().unwrap();
-                    let rect = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(max_w as _, nh as _));
-                    ctx.draw_image(rect, &cg);
-                    ctx.create_image()
-                } else {
-                    Some(cg)
+                }
+
+                if h264_frame_count % 150 == 0 && last_report.elapsed() >= Duration::from_secs(3) {
+                    print!("\r  {} frames", h264_frame_count);
+                    std::io::stdout().flush().ok();
+                    last_report = Instant::now();
                 }
             }
-        };
-
-        if let Some(ref cg) = shared_cg {
-            let result = h264_encoder.as_ref()
-                .map(|e| e.encode_frame(cg, h264_frame_count, 30));
-            match result {
-                Some(Ok(frame)) => {
-                    h264_frame_count += 1;
-
-                    {
-                        let wr = wr_handle.lock().unwrap();
-                        if let Some(ref wr) = *wr {
-                            if let Err(e) = wr.send_frame(&frame) {
-                                eprintln!("  WebRTC send error: {}", e);
-                            }
-                        }
-                    }
-
-                    if h264_frame_count % 150 == 0 && last_report.elapsed() >= Duration::from_secs(3) {
-                        print!("\r  {} frames", h264_frame_count);
-                        std::io::stdout().flush().ok();
-                        last_report = Instant::now();
-                    }
-                }
-                Some(Err(e)) => {
-                    eprintln!("  H.264 encode error: {}, restarting encoder", e);
-                    h264_encoder = h264::VtEncoder::new(enc_w, enc_h, fps).ok();
-                    h264_frame_count = 0;
-                }
-                None => {
-                    h264_encoder = h264::VtEncoder::new(enc_w, enc_h, fps).ok();
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if last_frame.elapsed() > Duration::from_secs(3) && h264_frame_count > 0 {
+                    eprintln!("\n  No frames for 3s — encoder may have failed");
+                    last_frame = Instant::now();
                 }
             }
-        }
-        let now = Instant::now();
-        if now < next_capture {
-            thread::sleep(next_capture - now);
-        }
-        next_capture += frame_dur;
-        if next_capture < now {
-            next_capture = now;
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("  Encoder channel disconnected");
+                break;
+            }
         }
     }
 
+    // Cleanup
+    capture_session.stop();
     srv.join().ok();
 }

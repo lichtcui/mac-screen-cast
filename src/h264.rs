@@ -135,6 +135,10 @@ pub struct VtEncoder {
     rx: mpsc::Receiver<H264Frame>,
 }
 
+// VTCompressionSession is thread-safe (Apple docs).
+unsafe impl Send for VtEncoder {}
+unsafe impl Sync for VtEncoder {}
+
 impl VtEncoder {
     pub fn new(width: u32, height: u32, fps: u32) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
@@ -258,6 +262,55 @@ impl VtEncoder {
         }
 
         // Sync: flush + wait for callback (with 5s timeout)
+        unsafe { VTCompressionSessionCompleteFrames(self.session, kCMTimeInvalid) };
+        self.rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|e| format!("encode timeout/error: {:?}", e))
+    }
+
+    /// Encode a raw CVPixelBuffer (from ScreenCaptureKit) into an H.264 frame.
+    /// Skips the CGImage → CVPixelBuffer copy used by encode_frame.
+    pub fn encode_pixelbuffer(
+        &self,
+        pixel_buffer: *mut c_void,
+        _width: u32,
+        _height: u32,
+        frame_num: u64,
+        frame_dur_tscale: i32,
+    ) -> Result<H264Frame, String> {
+        let pts = CMTime {
+            value: (frame_num * frame_dur_tscale as u64) as i64,
+            timescale: frame_dur_tscale,
+            flags: 0,
+            epoch: 0,
+        };
+        let dur = CMTime {
+            value: frame_dur_tscale as i64,
+            timescale: frame_dur_tscale,
+            flags: 0,
+            epoch: 0,
+        };
+
+        let encode_status = unsafe {
+            VTCompressionSessionEncodeFrame(
+                self.session,
+                pixel_buffer,
+                pts,
+                dur,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+
+        if encode_status != 0 {
+            unsafe { VTCompressionSessionCompleteFrames(self.session, kCMTimeInvalid) };
+            return Err(format!(
+                "VTCompressionSessionEncodeFrame failed: {}",
+                encode_status
+            ));
+        }
+
         unsafe { VTCompressionSessionCompleteFrames(self.session, kCMTimeInvalid) };
         self.rx
             .recv_timeout(Duration::from_secs(5))
