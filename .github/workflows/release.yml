@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string for the archive (e.g. v0.1.0-test)"
+        required: true
+        default: "v0.0.0-test"
+      dry-run:
+        description: "Run the full pipeline but skip creating a GitHub Release"
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check & Lint & Test
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Build
+        run: cargo build
+
+      - name: Run tests
+        run: cargo test
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Check dependencies for vulnerabilities
+        run: cargo audit
+
+  build-release:
+    name: Build Release Binary
+    runs-on: macos-latest
+    needs: [check, audit]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Determine target triplet
+        id: target
+        run: echo "triplet=$(rustc -vV | sed -n 's/host: //p')" >> "$GITHUB_OUTPUT"
+
+      - name: Determine version tag
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "tag=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Archive binary
+        run: |
+          TRIPLET=${{ steps.target.outputs.triplet }}
+          TAG=${{ steps.version.outputs.tag }}
+          NAME="mac-screen-cast-${TAG}-${TRIPLET}"
+          tar czf "${NAME}.tar.gz" -C target/release mac-screen-cast
+          sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            mac-screen-cast-*.tar.gz
+            mac-screen-cast-*.tar.gz.sha256
+
+  publish:
+    name: Publish to GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-release]
+    if: github.event_name != 'workflow_dispatch'
+    permissions:
+      contents: write
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            mac-screen-cast-*.tar.gz
+            mac-screen-cast-*.tar.gz.sha256
