@@ -145,61 +145,150 @@ impl WebRtcHandle {
             .rtp_timestamp
             .fetch_add(self.rtp_ts_per_frame, Ordering::Relaxed);
 
+        let mut rtp_packets: Vec<(Vec<u8>, bool)> = Vec::new();
+        for (nal_data, is_last_nal) in nal_units {
+            rtp_packets.extend(packetize_nal(nal_data, is_last_nal, RTP_MTU));
+        }
+
         let source = self.sample_source.clone();
         self.rt.block_on(async move {
-            for (nal_data, is_last_nal) in nal_units {
-                if nal_data.is_empty() {
-                    continue;
-                }
-                let nal_header = nal_data[0];
-                let total_size = nal_data.len();
-
-                if total_size <= RTP_MTU {
-                    source
-                        .send_video(VideoFrame {
-                            rtp_timestamp: ts,
-                            data: Bytes::from(nal_data),
-                            is_last_packet: is_last_nal,
-                            ..Default::default()
-                        })
-                        .await
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    let fu_indicator = 0x1c | (nal_header & 0x60);
-                    let nal_type = nal_header & 0x1f;
-                    let max_chunk = RTP_MTU - 2;
-                    let mut offset = 1; // skip NAL header byte
-
-                    while offset < nal_data.len() {
-                        let chunk_end = (offset + max_chunk).min(nal_data.len());
-                        let chunk = &nal_data[offset..chunk_end];
-                        let is_first = offset == 1;
-                        let is_last = chunk_end >= nal_data.len();
-
-                        let fu_header = (if is_first { 0x80 } else { 0 })
-                            | (if is_last { 0x40 } else { 0 })
-                            | nal_type;
-
-                        let mut fu_payload = Vec::with_capacity(2 + chunk.len());
-                        fu_payload.push(fu_indicator);
-                        fu_payload.push(fu_header);
-                        fu_payload.extend_from_slice(chunk);
-
-                        source
-                            .send_video(VideoFrame {
-                                rtp_timestamp: ts,
-                                data: Bytes::from(fu_payload),
-                                is_last_packet: is_last && is_last_nal,
-                                ..Default::default()
-                            })
-                            .await
-                            .map_err(|e| e.to_string())?;
-
-                        offset = chunk_end;
-                    }
-                }
+            for (payload, is_last) in rtp_packets {
+                source
+                    .send_video(VideoFrame {
+                        rtp_timestamp: ts,
+                        data: Bytes::from(payload),
+                        is_last_packet: is_last,
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             Ok(())
         })
+    }
+}
+
+/// Packetize a NAL unit into one or more RTP payloads.
+///
+/// NAL units smaller than `mtu` are sent as a single packet.
+/// Larger units are fragmented using FU-A (RFC 6184).
+pub(crate) fn packetize_nal(
+    data: Vec<u8>,
+    is_last_nal: bool,
+    mtu: usize,
+) -> Vec<(Vec<u8>, bool)> {
+    if data.is_empty() {
+        return vec![];
+    }
+    if data.len() <= mtu {
+        return vec![(data, is_last_nal)];
+    }
+    let nal_header = data[0];
+    let fu_indicator = 0x1c | (nal_header & 0x60);
+    let nal_type = nal_header & 0x1f;
+    let max_chunk = mtu - 2;
+    let mut packets = Vec::new();
+    let mut offset = 1;
+    while offset < data.len() {
+        let chunk_end = (offset + max_chunk).min(data.len());
+        let chunk = &data[offset..chunk_end];
+        let is_first = offset == 1;
+        let is_last = chunk_end >= data.len();
+        let fu_header = (if is_first { 0x80 } else { 0 })
+            | (if is_last { 0x40 } else { 0 })
+            | nal_type;
+        let mut payload = Vec::with_capacity(2 + chunk.len());
+        payload.push(fu_indicator);
+        payload.push(fu_header);
+        payload.extend_from_slice(chunk);
+        packets.push((payload, is_last && is_last_nal));
+        offset = chunk_end;
+    }
+    packets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packetize_empty() {
+        assert!(packetize_nal(vec![], false, 1200).is_empty());
+    }
+
+    #[test]
+    fn packetize_single_small() {
+        let nal = vec![0x41, 0x01, 0x02, 0x03];
+        let packets = packetize_nal(nal, true, 1200);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].0, &[0x41, 0x01, 0x02, 0x03]);
+        assert!(packets[0].1);
+    }
+
+    #[test]
+    fn packetize_exact_mtu() {
+        let mut nal = vec![0x41];
+        nal.extend(std::iter::repeat(0xFF).take(1199));
+        let packets = packetize_nal(nal, true, 1200);
+        assert_eq!(packets.len(), 1);
+    }
+
+    #[test]
+    fn packetize_is_last_propagated() {
+        let nal = vec![0x41, 0x01, 0x02, 0x03];
+        let packets = packetize_nal(nal, false, 1200);
+        assert_eq!(packets.len(), 1);
+        assert!(!packets[0].1);
+    }
+
+    #[test]
+    fn packetize_fua_basic() {
+        let nal_type = 0x65;
+        let mut nal = vec![nal_type];
+        nal.extend(std::iter::repeat(0xFF).take(2400));
+        let packets = packetize_nal(nal, true, 1200);
+        assert!(packets.len() >= 2, "should be fragmented into {} packets", packets.len());
+        // All packets ≤ MTU
+        for p in &packets {
+            assert!(p.0.len() <= 1200, "packet too large: {}", p.0.len());
+        }
+        // First: FU-A start bit
+        assert_ne!(packets[0].0[1] & 0x80, 0);
+        assert!(!packets[0].1);
+        // Last: FU-A end bit
+        assert_ne!(packets.last().unwrap().0[1] & 0x40, 0);
+        assert!(packets.last().unwrap().1);
+    }
+
+    #[test]
+    fn packetize_fua_nal_type_preserved() {
+        let mut nal = vec![0x21]; // NRI=1, type=1
+        nal.extend(std::iter::repeat(0xFF).take(2000));
+        let packets = packetize_nal(nal, true, 1200);
+        for p in &packets {
+            assert_eq!(p.0[1] & 0x1f, 1, "NAL type should be 1");
+        }
+    }
+
+    #[test]
+    fn packetize_fua_is_last_nal_false() {
+        let mut nal = vec![0x65];
+        nal.extend(std::iter::repeat(0xFF).take(2400));
+        let packets = packetize_nal(nal, false, 1200);
+        assert!(!packets.last().unwrap().1);
+    }
+
+    #[test]
+    fn packetize_fua_three_fragments() {
+        // 2401 byte NAL → 3 FU-A fragments (max_chunk=1198)
+        let mut nal = vec![0x41];
+        nal.extend(std::iter::repeat(0xAA).take(2400));
+        let packets = packetize_nal(nal, true, 1200);
+        assert_eq!(packets.len(), 3);
+        assert_ne!(packets[0].0[1] & 0x80, 0); // start
+        assert_eq!(packets[0].0[1] & 0x40, 0);
+        assert_eq!(packets[1].0[1] & 0xC0, 0); // continuation (no S/E)
+        assert_eq!(packets[2].0[1] & 0x80, 0);
+        assert_ne!(packets[2].0[1] & 0x40, 0); // end
     }
 }

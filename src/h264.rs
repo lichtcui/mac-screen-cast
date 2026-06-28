@@ -179,7 +179,7 @@ pub fn avcc_nal_units(data: &[u8]) -> Vec<(Vec<u8>, bool)> {
             data[pos + 3],
         ]) as usize;
         pos += 4;
-        if pos + nal_size > data.len() {
+        if nal_size == 0 || pos + nal_size > data.len() {
             break;
         }
         let is_last = pos + nal_size >= data.len();
@@ -187,4 +187,92 @@ pub fn avcc_nal_units(data: &[u8]) -> Vec<(Vec<u8>, bool)> {
         pos += nal_size;
     }
     units
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn avcc(nal_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut nal: Vec<u8> = Vec::with_capacity(1 + payload.len());
+        nal.push(nal_type);
+        nal.extend_from_slice(payload);
+        let len = (nal.len() as u32).to_be_bytes();
+        [len.as_slice(), &nal].concat()
+    }
+
+    #[test]
+    fn avcc_nal_units_empty() {
+        assert!(avcc_nal_units(&[]).is_empty());
+    }
+
+    #[test]
+    fn avcc_nal_units_single() {
+        let data = avcc(0x41, &[1, 2, 3, 4]);
+        let units = avcc_nal_units(&data);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].0, &[0x41, 1, 2, 3, 4]);
+        assert!(units[0].1);
+    }
+
+    #[test]
+    fn avcc_nal_units_multiple() {
+        let n1 = avcc(0x41, &[1, 2]);
+        let n2 = avcc(0x41, &[3, 4, 5]);
+        let data = [n1.as_slice(), n2.as_slice()].concat();
+        let units = avcc_nal_units(&data);
+        assert_eq!(units.len(), 2);
+        assert!(!units[0].1);
+        assert_eq!(units[0].0, &[0x41, 1, 2]);
+        assert!(units[1].1);
+        assert_eq!(units[1].0, &[0x41, 3, 4, 5]);
+    }
+
+    #[test]
+    fn avcc_nal_units_truncated() {
+        let data = [0x00, 0x00, 0x00, 0x0A, 0x41, 0x01, 0x02];
+        assert!(avcc_nal_units(&data).is_empty());
+    }
+
+    #[test]
+    fn avcc_nal_units_zero_length() {
+        // Zero-length NAL at the end should stop parsing
+        let data = [0x00, 0x00, 0x00, 0x05, 0x41, 0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00];
+        let units = avcc_nal_units(&data);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].0, &[0x41, 0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn scan_for_idr_true() {
+        let data = avcc(0x65, &[0x88, 0x84]);
+        assert!(scan_for_idr(&data));
+    }
+
+    #[test]
+    fn scan_for_idr_false() {
+        let data = avcc(0x41, &[1, 2, 3, 4]);
+        assert!(!scan_for_idr(&data));
+    }
+
+    #[test]
+    fn scan_for_idr_among_multiple() {
+        let n1 = avcc(0x41, &[1, 2]);
+        let n2 = avcc(0x65, &[0x88]);
+        let data = [n1.as_slice(), n2.as_slice()].concat();
+        assert!(scan_for_idr(&data));
+    }
+
+    #[test]
+    fn scan_for_idr_early_exit() {
+        let n1 = avcc(0x65, &[0x88]);
+        let n2 = avcc(0x41, &[1, 2, 3]);
+        let data = [n1.as_slice(), n2.as_slice()].concat();
+        assert!(scan_for_idr(&data));
+    }
+
+    #[test]
+    fn scan_for_idr_empty() {
+        assert!(!scan_for_idr(&[]));
+    }
 }

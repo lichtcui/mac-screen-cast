@@ -55,3 +55,30 @@ pub fn get_ip() -> String {
     Command::new("sh").arg("-c").arg("ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1")
         .output().map(|o| String::from_utf8_lossy(&o.stdout).trim().into()).unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn html_contains_video_tag() {
+        let page = html(30);
+        assert!(page.contains("<video"));
+        assert!(page.contains("/offer"));
+        assert!(page.contains("/latency"));
+        assert!(page.contains("/signal"));
+    }
+
+    #[test]
+    fn html_contains_stun() {
+        let page = html(30);
+        assert!(page.contains("stun:stun.l.google.com:19302"));
+    }
+
+    #[test]
+    fn get_ip_returns_string() {
+        let ip = get_ip();
+        assert!(!ip.is_empty());
+        assert!(ip.contains('.'));
+    }
+}

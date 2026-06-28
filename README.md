@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/mac-screen-cast)](https://crates.io/crates/mac-screen-cast)
 [![License](https://img.shields.io/crates/l/mac-screen-cast)](LICENSE)
 
-Stream macOS screen to browser. Uses ScreenCaptureKit for zero-copy capture, VideoToolbox for hardware H.264 encoding, and WebRTC for low-latency delivery.
+Stream macOS screen to browser over LAN. Uses ScreenCaptureKit for zero-copy capture, VideoToolbox for hardware H.264 encoding, and WebRTC for low-latency delivery.
 
 ## Requirements
 
@@ -41,7 +41,9 @@ mac-screen-cast -w <window-id> --width 1280 --fps 30
 mac-screen-cast -w <window-id> --port 9090
 ```
 
-After starting, open the printed URL (e.g. `http://192.168.1.100:8080`) in a browser to view the stream.
+After starting, open the printed URL (e.g. `http://192.168.1.100:8080`) in a browser on the same network to view the stream.
+
+> No TURN server is configured, so streams only work within the local network.
 
 ### Options
 
