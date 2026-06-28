@@ -1,4 +1,4 @@
-#![allow(non_upper_case_globals)]
+#![allow(non_upper_case_globals, dead_code)]
 
 use std::ffi::c_void;
 use std::sync::mpsc;

@@ -4,7 +4,7 @@ mod h264;
 mod server;
 mod webrtc;
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 pub struct Fmp4State {
     sps: Vec<u8>,
     pps: Vec<u8>,

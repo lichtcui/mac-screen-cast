@@ -141,7 +141,6 @@ impl WebRtcHandle {
         let pc = self.pc.clone();
         let c = candidate.to_string();
         self._rt.block_on(async {
-            use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
             use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
             let init = RTCIceCandidateInit {
                 candidate: c,
