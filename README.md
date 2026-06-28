@@ -27,21 +27,13 @@ cargo install mac-screen-cast
 
 ## Usage
 
+Just run it — you'll be prompted to pick a window:
+
 ```bash
-# List available windows
-mac-screen-cast -l
-
-# Stream a specific window
-mac-screen-cast -w <window-id>
-
-# Set resolution and frame rate
-mac-screen-cast -w <window-id> --width 1280 --fps 30
-
-# Use custom port
-mac-screen-cast -w <window-id> --port 9090
+mac-screen-cast
 ```
 
-After starting, open the printed URL (e.g. `http://192.168.1.100:8080`) in a browser on the same network to view the stream.
+After selecting a window, open the printed URL (e.g. `http://192.168.1.100:8080`) in any browser on the same network.
 
 > No TURN server is configured, so streams only work within the local network.
 
@@ -49,19 +41,31 @@ After starting, open the printed URL (e.g. `http://192.168.1.100:8080`) in a bro
 
 | Flag | Description | Default |
 |------|-------------|---------|
+| `-w`, `--window-id` | Window ID to capture (skips picker) | (interactive) |
 | `-l`, `--list` | List visible windows | |
-| `-w`, `--window-id` | Window ID to capture | (interactive picker) |
 | `--width` | Max output width in pixels | `1280` |
 | `--fps` | Target frame rate (1-60) | `30` |
 | `--port` | HTTP server port | `8080` |
+| `--json` | JSON output (use with `--list`) | |
 | `-h`, `--help` | Show help | |
 
-### Interactive mode
-
-Run without `-w` to pick from a list of visible windows:
+### Examples
 
 ```bash
+# Interactive: pick from a list
 mac-screen-cast
+
+# Direct: specify window ID
+mac-screen-cast -w 12345
+
+# 720p at 60 fps
+mac-screen-cast -w 12345 --width 1280 --fps 60
+
+# Custom port
+mac-screen-cast -w 12345 --port 9090
+
+# List windows as JSON (for scripting)
+mac-screen-cast -l --json
 ```
 
 ## Performance
