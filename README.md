@@ -1,6 +1,7 @@
 # mac-screen-cast
 
 [![Crates.io](https://img.shields.io/crates/v/mac-screen-cast)](https://crates.io/crates/mac-screen-cast)
+[![Downloads](https://img.shields.io/crates/d/mac-screen-cast)](https://crates.io/crates/mac-screen-cast)
 [![License](https://img.shields.io/crates/l/mac-screen-cast)](LICENSE)
 
 Stream macOS screen to browser over LAN. Uses ScreenCaptureKit for zero-copy capture, VideoToolbox for hardware H.264 encoding, and WebRTC for low-latency delivery.
