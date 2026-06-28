@@ -55,7 +55,13 @@ After selecting a window, open the printed URL (e.g. `http://192.168.1.100:8080`
 # Interactive: pick from a list
 mac-screen-cast
 
-# Direct: specify window ID
+# List windows (find window IDs)
+mac-screen-cast -l
+
+# List windows as JSON (for scripting)
+mac-screen-cast -l --json
+
+# Stream a specific window
 mac-screen-cast -w 12345
 
 # 720p at 60 fps
@@ -63,9 +69,6 @@ mac-screen-cast -w 12345 --width 1280 --fps 60
 
 # Custom port
 mac-screen-cast -w 12345 --port 9090
-
-# List windows as JSON (for scripting)
-mac-screen-cast -l --json
 ```
 
 ## Performance
