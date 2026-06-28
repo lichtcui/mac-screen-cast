@@ -1,4 +1,4 @@
-# mac-cast
+# mac-screen-cast
 
 macOS screen capture + H.264 encoding + WebRTC streaming to browser.
 

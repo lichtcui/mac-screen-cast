@@ -1211,6 +1211,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "mac-cast"
+version = "0.1.0"
+dependencies = [
+ "apple-cf",
+ "bytes",
+ "ctrlc",
+ "rustls",
+ "rustrtc",
+ "screencapturekit",
+ "serde_json",
+ "tiny_http",
+ "tokio",
+ "videotoolbox",
+]
+
+[[package]]
 name = "md-5"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1712,22 +1728,6 @@ checksum = "c549b1b0bc1ae3a536a88e3097d394234657402191e6867a3215bd897d43b9fd"
 dependencies = [
  "apple-cf",
  "apple-metal",
-]
-
-[[package]]
-name = "screenstream"
-version = "0.1.0"
-dependencies = [
- "apple-cf",
- "bytes",
- "ctrlc",
- "rustls",
- "rustrtc",
- "screencapturekit",
- "serde_json",
- "tiny_http",
- "tokio",
- "videotoolbox",
 ]
 
 [[package]]

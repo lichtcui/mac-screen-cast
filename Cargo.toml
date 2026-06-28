@@ -1,5 +1,5 @@
 [package]
-name = "mac-cast"
+name = "mac-screen-cast"
 version = "0.1.0"
 edition = "2021"
 
