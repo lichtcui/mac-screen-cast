@@ -22,28 +22,32 @@ for x in w { if let n = x[kCGWindowName as String] as? String, !n.isEmpty,
     }).collect()
 }
 
-/// WebRTC video page. Browser fetches /offer for SDP, POSTs answer to /signal.
-pub fn html(fps: u32) -> String {
-    let fps_str = fps.to_string();
+/// WebRTC video page with real-time latency display.
+pub fn html(_fps: u32) -> String {
     r#"<!DOCTYPE html><html><meta charset="utf-8"><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>ScreenStream</title><style>*{margin:0;background:#000}body{display:flex;min-height:100vh;min-height:100dvh;align-items:center;justify-content:center}video{width:100%;max-height:100vh;max-height:100dvh}#b{position:fixed;bottom:0;left:0;right:0;display:flex;gap:12px;padding:3px 10px;background:rgba(0,0,0,.5);color:#aaa;font:11px/1.3 monospace;z-index:99;user-select:none}}.g{color:#4a4}.r{color:#c44}</style><body><video id=v autoplay muted playsinline></video><div id=b><span id=st class=r>connecting</span></div><script>
 var v=document.getElementById('v'),st=document.getElementById('st'),pc;
 fetch('/offer').then(r=>r.text()).then(async o=>{
 pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-pc.ontrack=e=>{v.srcObject=e.streams[0];v.onloadedmetadata=()=>{st.textContent=v.videoWidth+'x'+v.videoHeight+' @ FPSfps';st.className='g'}};
-pc.oniceconnectionstatechange=()=>{var s=pc.iceConnectionState;st.textContent=s;if(s==='failed')console.log('ICE failed, check console for details')};
-pc.onicecandidateerror=e=>console.error('ICE candidate error:',e.message);
+pc.ontrack=e=>{v.srcObject=e.streams[0];v.onloadedmetadata=()=>st.className='g'};
+pc.oniceconnectionstatechange=()=>{var s=pc.iceConnectionState;st.textContent=s;if(s==='failed')console.log('ICE failed')};
+pc.onicecandidateerror=e=>console.warn('ICE candidate error:',e.errorText||'timeout',e.url||'');
+setInterval(async()=>{
+  try{
+    var lat=await(await fetch('/latency')).text();
+    st.textContent=lat+'ms latency'
+  }catch(e){}
+},1000);
 var candidates=[];
 pc.onicecandidate=e=>{if(e.candidate)candidates.push({candidate:e.candidate.candidate,sdpMid:e.candidate.sdpMid,sdpMLineIndex:e.candidate.sdpMLineIndex})};
 pc.addTransceiver('video',{direction:'recvonly'});
 await pc.setRemoteDescription({type:'offer',sdp:o});
 var a=await pc.createAnswer();
 await pc.setLocalDescription(a);
-// Wait for ICE gathering, then send answer with candidates
 await new Promise(r=>{if(pc.iceGatheringState==='complete')r();else pc.onicegatheringstatechange=ev=>{if(pc.iceGatheringState==='complete')r()}});
 var msg={sdp:a.sdp,candidates:candidates};
 fetch('/signal',{method:'POST',body:JSON.stringify(msg)})
 }).catch(e=>{st.textContent='error: '+e.message;st.className='r'})
-</script>"#.replace("FPS", &fps_str)
+</script>"#.to_string()
 }
 
 /// Get local IP address.

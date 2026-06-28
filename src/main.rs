@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 use screencapturekit::cm::CMSampleBuffer;
 use screencapturekit::prelude::*;
 
+fn lock_mutex<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn main() {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::ring::default_provider(),
@@ -141,16 +145,17 @@ fn main() {
         }
     };
 
-    // ── Channel: encoded frames → WebRTC sender ──
-    let (frame_tx, frame_rx) = mpsc::channel::<h264::H264Frame>();
+    // ── Channel: encoded frames (+ capture timestamp) → WebRTC sender ──
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<(h264::H264Frame, Instant)>(60);
 
     // ── Stop flag ──
     let stop = Arc::new(AtomicBool::new(false));
-    static CTRLC_COUNT: AtomicBool = AtomicBool::new(false);
+    let ctrlc_count = Arc::new(AtomicBool::new(false));
     {
         let c_stop = stop.clone();
+        let c_count = ctrlc_count.clone();
         ctrlc::set_handler(move || {
-            if CTRLC_COUNT.swap(true, Ordering::Relaxed) {
+            if c_count.swap(true, Ordering::Relaxed) {
                 eprintln!("\nForce exit");
                 std::process::exit(1);
             }
@@ -160,13 +165,22 @@ fn main() {
         .ok();
     }
 
+    // ── Latency measurement ──
+    let latest_latency = Arc::new(AtomicU64::new(0));
+
     // ── WebRTC ──
+    let webrtc_rt = Arc::new(
+        tokio::runtime::Runtime::new().expect("create Tokio runtime for WebRTC"),
+    );
     let wr_handle: Arc<Mutex<Option<webrtc::WebRtcHandle>>> = Arc::new(Mutex::new(None));
     let webrtc_connected = Arc::new(AtomicBool::new(false));
     let srv_wr = wr_handle.clone();
+    let srv_rt = webrtc_rt.clone();
     let srv_wr_conn = webrtc_connected.clone();
     let svr_s = stop.clone();
+    let srv_lat = latest_latency.clone();
     let ip = server::get_ip();
+    eprintln!("  Initializing WebRTC...");
 
     let srv = thread::spawn(move || {
         use tiny_http::{Header, Response};
@@ -198,17 +212,27 @@ fn main() {
                             .unwrap(),
                     ),
                 "/offer" => {
-                    if srv_wr_conn.load(Ordering::Relaxed) {
-                        if let Some(ref wr) = *srv_wr.lock().unwrap() {
-                            wr.close();
+                    // Refresh: close old PeerConnection, create new one
+                    let was_connected = srv_wr_conn.swap(false, Ordering::Relaxed);
+                    if was_connected {
+                        // Close old PC inside the shared runtime
+                        {
+                            let guard = lock_mutex(&srv_wr);
+                            if let Some(ref wr) = *guard {
+                                wr.close();
+                            }
                         }
-                        srv_wr_conn.store(false, Ordering::Relaxed);
-                        if let Ok(new_handle) = webrtc::WebRtcHandle::new(svr_s.clone()) {
-                            eprintln!("  WebRTC offer recreated");
-                            *srv_wr.lock().unwrap() = Some(new_handle);
+                        // Create replacement PeerConnection on the same runtime
+                        if let Ok(new_handle) =
+                            webrtc::WebRtcHandle::new(srv_rt.handle().clone(), fps, svr_s.clone())
+                        {
+                            *lock_mutex(&srv_wr) = Some(new_handle);
+                            eprintln!("  WebRTC offer recreated for refresh");
+                        } else {
+                            eprintln!("  WebRTC recreate failed");
                         }
                     }
-                    match srv_wr.lock().unwrap().as_ref() {
+                    match lock_mutex(&srv_wr).as_ref() {
                         Some(wr) => Response::from_data(wr.offer.clone().into_bytes())
                             .with_header(
                                 "Content-Type: application/sdp"
@@ -221,7 +245,7 @@ fn main() {
                 "/signal" => {
                     let mut body = String::new();
                     if req.as_reader().read_to_string(&mut body).is_ok() {
-                        if let Some(ref wr) = *srv_wr.lock().unwrap() {
+                        if let Some(ref wr) = *lock_mutex(&srv_wr) {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                                 if let Some(sdp) = v["sdp"].as_str() {
                                     let _ = wr.set_answer(sdp.to_string());
@@ -249,6 +273,10 @@ fn main() {
                     }
                     Response::from_data(Vec::from("ok"))
                 }
+                "/latency" => {
+                    let ms = srv_lat.load(Ordering::Relaxed);
+                    Response::from_data(format!("{}", ms).into_bytes())
+                }
                 _ => Response::from_data(Vec::new()).with_status_code(404),
             };
             req.respond(resp).ok();
@@ -257,12 +285,10 @@ fn main() {
 
     // ── Init WebRTC (blocks ~3s for ICE gathering) ──
     {
-        eprintln!("  Initializing WebRTC...");
-        let wstop = stop.clone();
-        match webrtc::WebRtcHandle::new(wstop) {
+        match webrtc::WebRtcHandle::new(webrtc_rt.handle().clone(), fps, stop.clone()) {
             Ok(handle) => {
                 eprintln!("  WebRTC offer ready");
-                *wr_handle.lock().unwrap() = Some(handle);
+                *lock_mutex(&wr_handle) = Some(handle);
             }
             Err(e) => eprintln!("  WebRTC init failed: {}", e),
         }
@@ -281,20 +307,24 @@ fn main() {
         fps,
         move |sample: CMSampleBuffer, _type: SCStreamOutputType| {
             let n = frame_count_cb.fetch_add(1, Ordering::Relaxed);
+            if n < 10 || n % 150 == 0 {
+                eprint!("\r  SCFrame #{}", n);
+                std::io::stderr().flush().ok();
+            }
             if let Some(pb) = sample.image_buffer() {
-                match encoder_cb.encode_pixelbuffer(
-                    pb.as_ptr(),
-                    pb.width() as u32,
-                    pb.height() as u32,
-                    n,
-                    fps as i32,
-                ) {
-                    Ok(frame) => {
-                        let _ = frame_tx_cb.send(frame);
+                if let Some(surface) = pb.io_surface() {
+                    let cap_time = Instant::now();
+                    match encoder_cb.encode(&surface, n, fps as i32) {
+                        Ok(frame) => {
+                            let _ = frame_tx_cb.send((frame, cap_time));
+                        }
+                        Err(e) => {
+                            eprintln!("\n  Encode error: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("  Encode error: {}", e);
-                    }
+                } else {
+                    eprint!("\r  No IOSurface for frame #{}", n);
+                    std::io::stderr().flush().ok();
                 }
             }
         },
@@ -313,15 +343,17 @@ fn main() {
 
     while !stop.load(Ordering::Relaxed) {
         match frame_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(frame) => {
+            Ok((frame, cap_time)) => {
                 h264_frame_count += 1;
                 last_frame = Instant::now();
 
-                if let Some(ref wr) = *wr_handle.lock().unwrap() {
+                if let Some(ref wr) = *lock_mutex(&wr_handle) {
                     if let Err(e) = wr.send_frame(&frame) {
                         eprintln!("  WebRTC send error: {}", e);
                     }
                 }
+
+                latest_latency.store(cap_time.elapsed().as_millis() as u64, Ordering::Relaxed);
 
                 if h264_frame_count % 150 == 0 && last_report.elapsed() >= Duration::from_secs(3) {
                     print!("\r  {} frames", h264_frame_count);

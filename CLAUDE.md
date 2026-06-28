@@ -29,7 +29,8 @@ This project uses [screencapturekit-rs](https://github.com/doom-fish/screencaptu
 - **Window capture**: `SCContentFilter::create().with_window(window).build()`
 - **Config**: `SCStreamConfiguration::default()` with builder-style setters (`set_width`, `set_height`, `set_pixel_format`, `set_minimum_frame_interval`, etc.)
 - **Handler**: `stream.add_output_handler(closure, SCStreamOutputType::Screen)` — closures matching `Fn(CMSampleBuffer, SCStreamOutputType) + Send + Sync + 'static` implement `SCStreamOutputTrait` automatically
-- **CVPixelBuffer access**: `sample.image_buffer()` returns `Option<CVPixelBuffer>`, use `.as_ptr()` for the raw `CVPixelBufferRef` to pass to VideoToolbox
+- **CVPixelBuffer access**: `sample.image_buffer()` returns `Option<CVPixelBuffer>`, extract `IOSurface` via `.io_surface()` for zero-copy encoding with videotoolbox-rs
+- **IOSurface → CVPixelBuffer roundtrip**: `pixel_buffer.io_surface()` returns `Option<IOSurface>`, pass `&IOSurface` to `CompressionSession::encode()`
 - **EXTRAS**: `CMSampleBufferExt` provides `.image_buffer()`, `.frame_status()`, `.presentation_timestamp()`
 
 ### CG initialization
@@ -55,3 +56,29 @@ The crate's own `cargo:rustc-link-arg` does not propagate to the final binary, s
 - [GitHub repo](https://github.com/doom-fish/screencapturekit-rs) — 23+ examples including basic capture, Metal, wgpu, FFmpeg, egui, Bevy, Tauri
 - Minimum macOS version: 12.3
 - Uses `apple-cf` for CoreMedia/CoreVideo types and `apple-metal` for Metal integration
+
+## H.264 Encoding
+
+This project uses [videotoolbox-rs](https://crates.io/crates/videotoolbox) (v0.18.x) by doom-fish for hardware H.264 encoding via VideoToolbox.
+
+### Key API patterns (v0.18.x)
+
+- **Session creation**: `CompressionSession::builder(width, height, Codec::H264)` with builder-style setters (`.with_real_time()`, `.with_expected_frame_rate()`, `.with_max_keyframe_interval()`, `.with_average_bit_rate()`, `.with_allow_frame_reordering()`)
+- **Encoding**: `session.encode(&iosurface, (pts_value, timescale))` — takes `&IOSurface` and a presentation timestamp tuple. Blocks until the frame is encoded.
+- **Output**: `EncodedFrame` with `.data` (AVCC-format NAL units, 4-byte length prefix), `.presentation_time`, `.cm_sample_buffer()` (optional underlying `CMSampleBuffer`)
+- **SPS/PPS extraction**: Available via `CMVideoFormatDescriptionGetH264ParameterSetAtIndex` on the format description from `EncodedFrame.cm_sample_buffer()`
+- **Keyframe detection**: Scan `EncodedFrame.data` for NAL type 5 (IDR) — AVCC format, byte at offset +4 masked with 0x1f
+
+### Pipeline
+
+```
+screencapturekit-rs → CMSampleBuffer → image_buffer() → CVPixelBuffer
+    → io_surface() → IOSurface → CompressionSession::encode() → EncodedFrame → H264Frame
+```
+
+### Reference
+
+- [crates.io/videotoolbox](https://crates.io/crates/videotoolbox)
+- [docs.rs/videotoolbox](https://docs.rs/videotoolbox/latest/videotoolbox/) — API docs
+- [GitHub repo](https://github.com/doom-fish/videotoolbox-rs)
+- [RFC 6184](https://datatracker.ietf.org/doc/html/rfc6184) — H.264 RTP payload format (FU-A fragmentation)
