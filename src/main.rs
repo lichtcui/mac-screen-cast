@@ -2,26 +2,18 @@ mod capture;
 mod fmp4;
 mod h264;
 mod server;
+mod webrtc;
 
-use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-
-use arc_swap::ArcSwap;
 
 use core_graphics::base::{kCGBitmapByteOrder32Big, kCGImageAlphaNoneSkipFirst};
 use core_graphics::color_space::CGColorSpace;
 use core_graphics::context::{CGContext, CGInterpolationQuality};
 use core_graphics::geometry::{CGRect, CGPoint, CGSize};
-
-fn epoch_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -73,20 +65,14 @@ fn main() {
 
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Shared video state for fMP4
-    let video_init: Arc<ArcSwap<Vec<u8>>> = Arc::new(ArcSwap::from_pointee(Vec::new()));
-    let video_segments: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-    let video_seg_count: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
-    let video_seg_base: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
-    let last_h264_req: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let wr_handle: Arc<Mutex<Option<webrtc::WebRtcHandle>>> = Arc::new(Mutex::new(None));
+    let webrtc_connected = Arc::new(AtomicBool::new(false));
     let svr_s = stop.clone();
     let svr_port = port;
     let ip = server::get_ip();
 
-    let srv_video_init = video_init.clone();
-    let srv_video_segs = video_segments.clone();
-    let srv_video_base = video_seg_base.clone();
-    let srv_last_h264 = last_h264_req.clone();
+    let srv_wr = wr_handle.clone();
+    let srv_wr_conn = webrtc_connected.clone();
 
     let srv = thread::spawn(move || {
         use tiny_http::{Header, Response};
@@ -94,76 +80,47 @@ fn main() {
             Ok(s) => s,
             Err(e) => { eprintln!("端口 {} 被占用: {}", svr_port, e); return; }
         };
-        eprintln!("\n  H.264 stream  →  http://{}:{}", ip, svr_port);
-
-        let hdr_ct_video = || "Content-Type: video/mp4".parse::<Header>().unwrap();
-        let hdr_cache = || "Cache-Control: no-cache, no-store, must-revalidate".parse::<Header>().unwrap();
-        let hdr_pragma = || "Pragma: no-cache".parse::<Header>().unwrap();
-        let hdr_expires = || "Expires: 0".parse::<Header>().unwrap();
-        let hdr_cors = || "Access-Control-Allow-Origin: *".parse::<Header>().unwrap();
-        let hdr_seg = |n: u32| format!("X-Seg: {}", n).parse::<Header>().unwrap();
+        eprintln!("\n  WebRTC stream →  http://{}:{}", ip, svr_port);
 
         loop {
             if svr_s.load(Ordering::Relaxed) { break; }
-            let req = match server.recv_timeout(Duration::from_millis(500)) {
+            let mut req = match server.recv_timeout(Duration::from_millis(500)) {
                 Ok(Some(r)) => r, _ => continue,
             };
             let url = req.url();
             let path = url.split('?').next().unwrap_or("/");
+
             let resp = match path {
                 "/" => Response::from_data(server::html(fps).into_bytes())
                     .with_header("Content-Type: text/html; charset=utf-8".parse::<Header>().unwrap()),
-                "/init.mp4" => {
-                    srv_last_h264.store(epoch_millis(), Ordering::Relaxed);
-                    let data = srv_video_init.load_full();
-                    if data.is_empty() {
-                        let mut result = Response::from_data(Vec::new()).with_status_code(503);
-                        for _ in 0..50 {
-                            thread::sleep(Duration::from_millis(100));
-                            let d = srv_video_init.load_full();
-                            if !d.is_empty() {
-                                result = Response::from_data(d.to_vec())
-                                    .with_header(hdr_ct_video());
-                                break;
-                            }
-                        }
-                        result
-                    } else {
-                        Response::from_data(data.to_vec()).with_header(hdr_ct_video())
+                "/offer" => {
+                    match srv_wr.lock().unwrap().as_ref() {
+                        Some(wr) => Response::from_data(wr.offer.clone().into_bytes())
+                            .with_header("Content-Type: application/sdp".parse::<Header>().unwrap()),
+                        None => Response::from_data(Vec::from("not ready")).with_status_code(503),
                     }
                 }
-                "/seg" => {
-                    srv_last_h264.store(epoch_millis(), Ordering::Relaxed);
-                    let after: u32 = url.split('?').nth(1).and_then(|q| {
-                        q.split('&').next().and_then(|s| s.parse().ok())
-                    }).unwrap_or(0);
-                    let mut result = Response::from_data(Vec::new()).with_status_code(503);
-                    for _ in 0..100 {
-                        if svr_s.load(Ordering::Relaxed) { break; }
-                        let base = srv_video_base.load(Ordering::Acquire);
-                        let segs = srv_video_segs.lock().unwrap();
-                        if segs.is_empty() { drop(segs); thread::sleep(Duration::from_millis(50)); continue; }
-                        let seg_num = if after >= base {
-                            let idx = (after - base) as usize;
-                            if idx < segs.len() { after }
-                            else { drop(segs); thread::sleep(Duration::from_millis(50)); continue; }
-                        } else {
-                            base
-                        };
-                        let idx = (seg_num - base) as usize;
-                        if idx < segs.len() {
-                            result = Response::from_data(segs[idx].clone())
-                                .with_header(hdr_ct_video())
-                                .with_header(hdr_cache())
-                                .with_header(hdr_pragma())
-                                .with_header(hdr_expires())
-                                .with_header(hdr_cors())
-                                .with_header(hdr_seg(seg_num));
-                            break;
+                "/signal" => {
+                    let mut body = String::new();
+                    if req.as_reader().read_to_string(&mut body).is_ok() {
+                        if let Some(ref wr) = *srv_wr.lock().unwrap() {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                                if let Some(sdp) = v["sdp"].as_str() {
+                                    let _ = wr.set_answer(sdp.to_string());
+                                    if let Some(cands) = v["candidates"].as_array() {
+                                        for c in cands {
+                                            if let Some(cs) = c.as_str() {
+                                                let _ = wr.add_candidate(cs);
+                                            }
+                                        }
+                                    }
+                                    srv_wr_conn.store(true, Ordering::Relaxed);
+                                    eprintln!("  WebRTC connected");
+                                }
+                            }
                         }
-                        thread::sleep(Duration::from_millis(50));
                     }
-                    result
+                    Response::from_data(Vec::from("ok"))
                 }
                 _ => Response::from_data(Vec::new()).with_status_code(404),
             };
@@ -207,43 +164,29 @@ fn main() {
     let (enc_w, enc_h) = (enc_w & !1, enc_h & !1); // round down to even for encoder
 
     let mut h264_encoder: Option<h264::VtEncoder> = h264::VtEncoder::new(enc_w, enc_h, fps).ok();
-    let mut h264_fmp4: Option<fmp4::Fmp4State> = None;
     let mut h264_frame_count: u64 = 0;
-    let mut h264_ready = false;
-
-    let vt_init = video_init.clone();
-    let vt_segs = video_segments.clone();
-    let vt_count = video_seg_count.clone();
-    let vt_base = video_seg_base.clone();
-    let main_last_h264 = last_h264_req.clone();
     let mut scaler_ctx: Option<(CGContext, u32, u32)> = None;
 
     let mut last_report = Instant::now();
 
-    let mut idle_since: Option<Instant> = None;
+
+    // Initialize WebRTC (blocks until offer is generated)
+    {
+        eprintln!("  Initializing WebRTC...");
+        let wstop = stop.clone();
+        match webrtc::WebRtcHandle::new(wstop) {
+            Ok(handle) => {
+                eprintln!("  WebRTC offer ready");
+                *wr_handle.lock().unwrap() = Some(handle);
+            }
+            Err(e) => eprintln!("  WebRTC init failed: {}", e),
+        }
+    }
 
     while !stop.load(Ordering::Relaxed) {
-        // Go idle when there have been no H.264 requests for 10 seconds
-        let clients_h264 = epoch_millis() - main_last_h264.load(Ordering::Relaxed) <= 10000;
-        if !clients_h264 && h264_ready {
-            match idle_since {
-                None => idle_since = Some(Instant::now()),
-                Some(t) if t.elapsed() > Duration::from_secs(10) => {
-                    thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-                _ => {}
-            }
-        } else {
-            idle_since = None;
-        }
-
         // Recover dead encoder
         if h264_encoder.is_none() {
             h264_encoder = h264::VtEncoder::new(enc_w, enc_h, fps).ok();
-            if h264_encoder.is_some() && h264_ready {
-                eprintln!("  H.264 encoder re-created");
-            }
         }
 
         // Capture and optionally scale using cached context
@@ -280,48 +223,25 @@ fn main() {
                 Some(Ok(frame)) => {
                     h264_frame_count += 1;
 
+                    {
+                        let wr = wr_handle.lock().unwrap();
+                        if let Some(ref wr) = *wr {
+                            if let Err(e) = wr.send_frame(&frame) {
+                                eprintln!("  WebRTC send error: {}", e);
+                            }
+                        }
+                    }
+
                     if h264_frame_count % 150 == 0 && last_report.elapsed() >= Duration::from_secs(3) {
-                        print!("\r  {} frames @ {}fps", h264_frame_count, fps);
+                        print!("\r  {} frames", h264_frame_count);
                         std::io::stdout().flush().ok();
                         last_report = Instant::now();
-                    }
-
-                    if h264_fmp4.is_none() && frame.sps.is_some() && frame.pps.is_some() {
-                        let sps = frame.sps.clone().unwrap();
-                        let pps = frame.pps.clone().unwrap();
-                        let fmp4 = fmp4::Fmp4State::new(sps, pps, enc_w, enc_h, 90000);
-                        let init_seg = fmp4.build_init_segment();
-                        vt_init.store(Arc::new(init_seg));
-                        h264_fmp4 = Some(fmp4);
-                    }
-
-                    if let Some(ref mut fmp4) = h264_fmp4 {
-                        let seg = fmp4.build_media_segment(
-                            &frame.data, frame.is_keyframe,
-                            frame.pts_timescale, frame.pts_value,
-                        );
-                        let mut segs = vt_segs.lock().unwrap();
-                        segs.push(seg);
-                        if segs.len() > 300 {
-                            segs.remove(0);
-                            vt_base.fetch_add(1, Ordering::Release);
-                        }
-                        vt_count.fetch_add(1, Ordering::Release);
-                        if !h264_ready {
-                            h264_ready = true;
-                            eprintln!("  H.264 stream ready");
-                        }
                     }
                 }
                 Some(Err(e)) => {
                     eprintln!("  H.264 encode error: {}, restarting encoder", e);
                     h264_encoder = h264::VtEncoder::new(enc_w, enc_h, fps).ok();
-                    h264_fmp4 = None;
-                    h264_ready = false;
                     h264_frame_count = 0;
-                    vt_init.store(Arc::new(Vec::new()));
-                    vt_segs.lock().unwrap().clear();
-                    vt_base.store(0, Ordering::Release);
                 }
                 None => {
                     h264_encoder = h264::VtEncoder::new(enc_w, enc_h, fps).ok();

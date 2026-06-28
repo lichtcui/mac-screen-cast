@@ -22,23 +22,27 @@ for x in w { if let n = x[kCGWindowName as String] as? String, !n.isEmpty,
     }).collect()
 }
 
-/// HTML page for the H.264 MSE video stream.
+/// WebRTC video page. Browser fetches /offer for SDP, POSTs answer to /signal.
 pub fn html(fps: u32) -> String {
     let fps_str = fps.to_string();
-    r#"<!DOCTYPE html><html><meta charset="utf-8"><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>ScreenStream</title><style>*{margin:0;background:#000}body{display:flex;min-height:100vh;min-height:100dvh;align-items:center;justify-content:center}video{width:100%;max-height:100vh;max-height:100dvh}#b{position:fixed;bottom:0;left:0;right:0;display:flex;gap:12px;padding:3px 10px;background:rgba(0,0,0,.5);color:#aaa;font:11px/1.3 monospace;z-index:99;user-select:none}}.g{color:#4a4}.r{color:#c44}</style><body><video id=v autoplay muted playsinline></video><div id=b><span id=st class=g>loading</span></div><script>
-let v=document.getElementById('v'),st=document.getElementById('st'),init=!1,m,ab,seg=0,FPS=FPS_VAL;
-fetch('/init.mp4').then(r=>r.arrayBuffer()).then(b=>{
-let d=new Uint8Array(b),p=-1;for(let i=0;i<d.length-4;i++){if(d[i]===0x61&&d[i+1]===0x76&&d[i+2]===0x63&&d[i+3]===0x43){p=i+5;break}}
-let codecs='avc1.'+[d[p],d[p+1],d[p+2]].map(x=>x.toString(16).padStart(2,'0')).join('');
-m=new MediaSource();m.onsourceopen=()=>{ab=m.addSourceBuffer('video/mp4;codecs="'+codecs+'"');ab.mode='sequence';ab.appendBuffer(b)};
-v.onloadedmetadata=()=>{st.textContent=v.videoWidth+'x'+v.videoHeight+' @ '+FPS+'fps';st.className='g'};
-v.src=URL.createObjectURL(m)
-}).catch(()=>{st.textContent='no h264';st.className='r'});
-(function p(){var t=Date.now();fetch('/seg?'+seg+'&'+t).then(r=>{
-if(!r.ok){setTimeout(p,500);return}
-seg=+r.headers.get('X-Seg')+1;return r.arrayBuffer()
-}).then(b=>{if(b&&ab&&!ab.updating)try{ab.appendBuffer(b);var ms=Date.now()-t;st.textContent=v.videoWidth+'x'+v.videoHeight+' @ '+FPS+'fps  '+ms+'ms';if(v.buffered.length&&v.currentTime<v.buffered.end(0)-1)v.currentTime=v.buffered.end(0)-0.5}catch(e){}setTimeout(p,30)}).catch(()=>setTimeout(p,1000))})()
-</script>"#.replace("FPS_VAL", &fps_str)
+    r#"<!DOCTYPE html><html><meta charset="utf-8"><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>ScreenStream</title><style>*{margin:0;background:#000}body{display:flex;min-height:100vh;min-height:100dvh;align-items:center;justify-content:center}video{width:100%;max-height:100vh;max-height:100dvh}#b{position:fixed;bottom:0;left:0;right:0;display:flex;gap:12px;padding:3px 10px;background:rgba(0,0,0,.5);color:#aaa;font:11px/1.3 monospace;z-index:99;user-select:none}}.g{color:#4a4}.r{color:#c44}</style><body><video id=v autoplay muted playsinline></video><div id=b><span id=st class=r>connecting</span></div><script>
+var v=document.getElementById('v'),st=document.getElementById('st'),pc;
+fetch('/offer').then(r=>r.text()).then(async o=>{
+pc=new RTCPeerConnection();
+pc.ontrack=e=>{v.srcObject=e.streams[0];v.onloadedmetadata=()=>{st.textContent=v.videoWidth+'x'+v.videoHeight+' @ FPSfps';st.className='g'}};
+pc.oniceconnectionstatechange=()=>{var s=pc.iceConnectionState;st.textContent=s};
+var candidates=[];
+pc.onicecandidate=e=>{if(e.candidate)candidates.push(e.candidate.toJSON().candidate)};
+pc.addTransceiver('video',{direction:'recvonly'});
+await pc.setRemoteDescription({type:'offer',sdp:o});
+var a=await pc.createAnswer();
+await pc.setLocalDescription(a);
+// Wait for ICE gathering, then send answer with candidates
+await new Promise(r=>{if(pc.iceGatheringState==='complete')r();else pc.onicegatheringstatechange=ev=>{if(pc.iceGatheringState==='complete')r()}});
+var msg={sdp:a.sdp,candidates:candidates};
+fetch('/signal',{method:'POST',body:JSON.stringify(msg)})
+}).catch(e=>{st.textContent='error: '+e.message;st.className='r'})
+</script>"#.replace("FPS", &fps_str)
 }
 
 /// Get local IP address.
@@ -46,4 +50,3 @@ pub fn get_ip() -> String {
     Command::new("sh").arg("-c").arg("ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1")
         .output().map(|o| String::from_utf8_lossy(&o.stdout).trim().into()).unwrap_or_default()
 }
-
