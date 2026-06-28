@@ -37,7 +37,6 @@ fn help_via_h() {
 }
 
 #[test]
-#[ignore = "requires Screen Recording permission"]
 fn list_windows() {
     let output = Command::new(binary_path())
         .arg("--list")
