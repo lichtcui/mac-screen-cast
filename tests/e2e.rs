@@ -20,11 +20,17 @@ fn help_shows_usage() {
         .output()
         .expect("failed to run binary");
     assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("mac-screen-cast"));
-    assert!(stdout.contains("-l"));
-    assert!(stdout.contains("--fps"));
-    assert!(stdout.contains("--port"));
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(all.contains("mac-screen-cast"));
+    assert!(all.contains("-l"));
+    assert!(all.contains("--fps"));
+    assert!(all.contains("--port"));
+    assert!(all.contains("--json"));
+    assert!(all.contains("HTTP API"));
 }
 
 #[test]

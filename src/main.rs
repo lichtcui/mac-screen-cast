@@ -58,7 +58,34 @@ fn main() {
                 return;
             }
             "-h" | "--help" => {
-                println!("mac-screen-cast [-l] [-w <id>] [--width <px>] [--fps <1-60>] [--port <n>]");
+                eprintln!("mac-screen-cast — stream macOS screen to browser over LAN");
+                eprintln!();
+                eprintln!("USAGE");
+                eprintln!("  mac-screen-cast [FLAGS] [OPTIONS]");
+                eprintln!("  mac-screen-cast -l [--json]");
+                eprintln!("  mac-screen-cast -w <id> [--width px] [--fps N] [--port N]");
+                eprintln!();
+                eprintln!("FLAGS");
+                eprintln!("  -l, --list       List visible windows (human-readable)");
+                eprintln!("       --json      JSON output for --list (machine-parseable)");
+                eprintln!("  -h, --help       Show this help");
+                eprintln!();
+                eprintln!("OPTIONS");
+                eprintln!("  -w, --window-id  Window ID to capture                    [env: none]");
+                eprintln!("      --width      Max output width in pixels              [default: 1280]");
+                eprintln!("      --fps        Target frame rate (1-60)                [default: 30]");
+                eprintln!("      --port       HTTP server port                        [default: 8080]");
+                eprintln!();
+                eprintln!("EXAMPLES");
+                eprintln!("  mac-screen-cast -l --json              List windows as JSON");
+                eprintln!("  mac-screen-cast -w 12345 --width 720   Stream at 720p");
+                eprintln!("  mac-screen-cast -w 12345 --fps 60      Stream at 60 fps");
+                eprintln!();
+                eprintln!("HTTP API");
+                eprintln!("  GET  /         HTML player page");
+                eprintln!("  GET  /offer    WebRTC SDP offer");
+                eprintln!("  POST /signal   WebRTC answer + ICE candidates (JSON body)");
+                eprintln!("  GET  /latency  Current capture-to-send latency (ms)");
                 return;
             }
             _ => {}
