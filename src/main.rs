@@ -13,6 +13,9 @@ use screencapturekit::cm::CMSampleBuffer;
 use screencapturekit::prelude::*;
 
 fn main() {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::ring::default_provider(),
+    );
     let args: Vec<String> = std::env::args().collect();
     let mut wid: u32 = 0;
     let mut max_w: u32 = 1280;

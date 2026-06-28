@@ -4,11 +4,15 @@ macOS screen capture + H.264 encoding + WebRTC streaming to browser.
 
 ## WebRTC
 
-This project uses [webrtc-rs](https://github.com/webrtc-rs/webrtc). When modifying WebRTC-related code:
+This project uses [rustrtc](https://github.com/restsend/rustrtc) (v0.3.x). When modifying WebRTC-related code:
 
-- Always check the [official examples](https://github.com/webrtc-rs/webrtc/tree/master/examples) for reference patterns, especially `broadcast`, `reflect`, and `play-from-disk-renegotiation`.
-- The crate version 0.10/0.11 had significant bugs (DTLS `invalid named curve`, ICE candidate handling). Current version is 0.17.1.
-- The API in examples (master branch) uses `PeerConnectionBuilder` (v0.20+). This project still uses the older `APIBuilder` + `RTCPeerConnection` API from 0.17.x.
+- rustrtc is a pure-Rust WebRTC implementation. Peer connections are created directly with `PeerConnection::new(config)` — no `APIBuilder` or `MediaEngine` needed.
+- Codec capabilities are configured via `MediaCapabilities` in `RtcConfiguration`.
+- Tracks are created with `sample_track(MediaKind::Video, capacity)` and added via `pc.add_track(track, RtpCodecParameters)`.
+- ICE gathering uses `pc.wait_for_gathering_complete().await`.
+- H.264 RTP fragmentation (FU-A) is done manually in `send_frame` — see [`RFC 6184`](https://datatracker.ietf.org/doc/html/rfc6184) for the packetization scheme.
+- `PeerConnection` is `Clone` (internally `Arc`), no mutex wrapping needed.
+- Requires `rustls::crypto::CryptoProvider::install_default()` before first `PeerConnection::new()`.
 
 ## Screen Capture
 
