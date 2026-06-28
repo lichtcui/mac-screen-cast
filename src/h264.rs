@@ -22,6 +22,8 @@ pub struct VtEncoder {
     cache: Mutex<SpsPpsCache>,
 }
 
+// VideoToolbox CompressionSession handles are thread-safe;
+// the cache Mutex provides interior mutability for SPS/PPS.
 unsafe impl Send for VtEncoder {}
 unsafe impl Sync for VtEncoder {}
 
@@ -95,6 +97,8 @@ fn extract_sps_pps(encoded: &EncodedFrame) -> (Option<Vec<u8>>, Option<Vec<u8>>)
         None => return (None, None),
     };
 
+    // SAFETY: CMSampleBufferGetFormatDescription is a CoreMedia C API.
+    // `sb` is a valid CMSampleBuffer from the encoder output (checked above).
     let fmt_desc: *mut c_void = unsafe {
         videotoolbox::ffi::CMSampleBufferGetFormatDescription(sb.as_ptr().cast())
     } as *mut c_void;
@@ -102,6 +106,10 @@ fn extract_sps_pps(encoded: &EncodedFrame) -> (Option<Vec<u8>>, Option<Vec<u8>>)
         return (None, None);
     }
 
+    // SAFETY: This FFI reads SPS/PPS parameter sets from a CoreMedia format
+    // description under the same object lifetime that the buffer is valid.
+    // The returned pointers point into the format description's stable backing
+    // memory and are safe to dereference within this scope.
     unsafe {
         let mut sps_ptr: *const u8 = std::ptr::null();
         let mut sps_size: usize = 0;

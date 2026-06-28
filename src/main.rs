@@ -98,6 +98,9 @@ fn main() {
     // ── Initialize CoreGraphics (required for SCKit before macOS 26+?) ──
     // The screencapturekit crate provides this FFI function to prevent
     // CGS_REQUIRE_INIT assertion failures in command-line tools.
+    // SAFETY: sc_initialize_core_graphics() is an FFI function exported by
+    // the screencapturekit crate. It initializes CoreGraphics internals and
+    // must be called once before any SCStream usage in command-line tools.
     unsafe { screencapturekit::ffi::sc_initialize_core_graphics() }
 
     // ── Compute output dimensions via SCShareableContent ──
