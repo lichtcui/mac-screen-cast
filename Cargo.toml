@@ -2,7 +2,7 @@
 name = "mac-screen-cast"
 version = "0.1.0"
 edition = "2021"
-description = "Stream macOS screen to browser via H.264 hardware encoding and WebRTC"
+description = "Stream macOS screen to browser over LAN. Zero-copy ScreenCaptureKit, hardware H.264 encoding via VideoToolbox, ~10ms pipeline latency, ~3% CPU."
 license = "MIT"
 repository = "https://github.com/lichtcui/mac-screen-cast"
 keywords = ["macos", "screen-capture", "webRTC", "h264", "videotoolbox"]

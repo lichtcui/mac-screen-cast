@@ -64,6 +64,19 @@ Run without `-w` to pick from a list of visible windows:
 mac-screen-cast
 ```
 
+## Performance
+
+Measured at 1280×772 @ 30fps with VideoToolbox hardware encoding on Apple Silicon (M-series):
+
+| Metric | Value |
+|--------|-------|
+| Pipeline latency (capture → send) | 8–16ms (measured via `/latency`) |
+| CPU usage | ~3% of one core |
+| Memory | ~22 MB RSS |
+| Frame rate | Stable 30 fps |
+
+The pipeline is entirely GPU-accelerated: ScreenCaptureKit delivers GPU-resident buffers, VideoToolbox encodes on the media engine, and the CPU is only used for RTP packetization (~1ms per frame). Total end-to-end latency (server → browser display) on LAN is typically 30–60ms.
+
 ## How it works
 
 ```
