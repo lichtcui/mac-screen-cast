@@ -8,8 +8,6 @@ use videotoolbox::session::Codec;
 pub struct H264Frame {
     pub data: Vec<u8>,
     pub is_keyframe: bool,
-    pub pts_timescale: i32,
-    pub pts_value: i64,
     pub sps: Option<Vec<u8>>,
     pub pps: Option<Vec<u8>>,
 }
@@ -85,8 +83,6 @@ impl VtEncoder {
         Ok(H264Frame {
             data: encoded.data,
             is_keyframe,
-            pts_timescale: encoded.presentation_time.1,
-            pts_value: encoded.presentation_time.0,
             sps,
             pps,
         })
