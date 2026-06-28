@@ -25,6 +25,7 @@ fn main() {
     let mut max_w: u32 = 1280;
     let mut fps: u32 = 30;
     let mut port: u16 = 8080;
+    let mut json_output = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -45,9 +46,14 @@ fn main() {
                 i += 1;
                 port = args[i].parse().unwrap_or(8080);
             }
+            "--json" => json_output = true,
             "-l" | "--list" => {
-                for (id, app, title) in server::list_windows() {
-                    println!("{:>5} | {} | {}", id, app, title);
+                if json_output {
+                    println!("{}", server::list_windows_json());
+                } else {
+                    for w in server::list_windows() {
+                        println!("{:>5} | {} | {}", w.id, w.app, w.title);
+                    }
                 }
                 return;
             }
@@ -69,16 +75,16 @@ fn main() {
         let mut seen = std::collections::HashSet::new();
         let mut uq = Vec::new();
         for w in &wins {
-            if seen.insert((&w.1, &w.2)) {
+            if seen.insert((&w.app, &w.title)) {
                 uq.push(w);
             }
         }
-        for (j, (_, a, t)) in uq.iter().enumerate() {
+        for (j, w) in uq.iter().enumerate() {
             println!(
                 "  [{:2}] {} - {}",
                 j + 1,
-                a,
-                if t.len() > 55 { &t[..55] } else { t }
+                w.app,
+                if w.title.len() > 55 { &w.title[..55] } else { &w.title }
             );
         }
         print!("Select window (1-{}): ", uq.len());
@@ -87,7 +93,7 @@ fn main() {
         std::io::stdin().read_line(&mut s).ok();
         if let Ok(n) = s.trim().parse::<usize>() {
             if n >= 1 && n <= uq.len() {
-                wid = uq[n - 1].0;
+                wid = uq[n - 1].id;
             }
         }
         if wid == 0 {
@@ -274,13 +280,16 @@ fn main() {
                             }
                         }
                     }
-                    Response::from_data(Vec::from("ok"))
+                    Response::from_data(Vec::from("{\"status\":\"ok\"}"))
+                        .with_header("Content-Type: application/json".parse::<Header>().unwrap())
                 }
                 "/latency" => {
                     let ms = srv_lat.load(Ordering::Relaxed);
                     Response::from_data(format!("{}", ms).into_bytes())
                 }
-                _ => Response::from_data(Vec::new()).with_status_code(404),
+                _ => Response::from_data(Vec::from("{\"error\":\"not found\"}"))
+                    .with_status_code(404)
+                    .with_header("Content-Type: application/json".parse::<Header>().unwrap()),
             };
             req.respond(resp).ok();
         }

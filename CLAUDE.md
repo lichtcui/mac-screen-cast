@@ -31,3 +31,18 @@ Uses [videotoolbox-rs](https://crates.io/crates/videotoolbox). Key patterns:
 - Output: `EncodedFrame.data` — AVCC format (4-byte length prefix per NAL)
 - SPS/PPS: `CMVideoFormatDescriptionGetH264ParameterSetAtIndex` on the format description from `EncodedFrame.cm_sample_buffer()`
 - Keyframe: scan `data` for NAL type 5 (`byte_at_offset_4 & 0x1f == 5`)
+
+## CLI (AI invocation)
+
+- `mac-screen-cast --list --json` — list windows as JSON array `[{"id":..,"app":..,"title":..}]`
+- `mac-screen-cast --list` — human-readable formatted list
+- `mac-screen-cast -w <id> [--width px] [--fps N] [--port N]` — start stream
+
+## HTTP API (at runtime)
+
+| Endpoint | Method | Response |
+|----------|--------|----------|
+| `/` | GET | HTML player page |
+| `/offer` | GET | SDP offer (text/plain) |
+| `/signal` | POST | `{"status":"ok"}` (JSON) |
+| `/latency` | GET | latency in ms (number, text/plain) |

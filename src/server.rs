@@ -1,7 +1,15 @@
 use std::process::Command;
 
+/// A visible window.
+#[derive(serde::Serialize)]
+pub struct Window {
+    pub id: u32,
+    pub app: String,
+    pub title: String,
+}
+
 /// List visible windows via Swift.
-pub fn list_windows() -> Vec<(u32, String, String)> {
+pub fn list_windows() -> Vec<Window> {
     let script = r#"
 import Foundation
 import CoreGraphics
@@ -18,8 +26,13 @@ for x in w { if let n = x[kCGWindowName as String] as? String, !n.isEmpty,
     if !out.status.success() { return Vec::new(); }
     String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| {
         let p: Vec<&str> = l.trim().split(" ||| ").collect();
-        if p.len() >= 3 { Some((p[0].parse().ok()?, p[1].into(), p[2].into())) } else { None }
+        if p.len() >= 3 { Some(Window { id: p[0].parse().ok()?, app: p[1].into(), title: p[2].into() }) } else { None }
     }).collect()
+}
+
+/// List windows as JSON array.
+pub fn list_windows_json() -> String {
+    serde_json::to_string(&list_windows()).unwrap_or_else(|_| "[]".into())
 }
 
 /// WebRTC video page with real-time latency display.

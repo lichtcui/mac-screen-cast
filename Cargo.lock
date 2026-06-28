@@ -1220,6 +1220,7 @@ dependencies = [
  "rustls",
  "rustrtc",
  "screencapturekit",
+ "serde",
  "serde_json",
  "tiny_http",
  "tokio",
