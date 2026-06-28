@@ -6,6 +6,7 @@ use tokio::runtime::Runtime;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
@@ -60,12 +61,36 @@ impl WebRtcHandle {
             "screenstream".to_owned(),
         ));
 
-        let config = RTCConfiguration::default();
+        let config = RTCConfiguration {
+            ice_servers: vec![RTCIceServer {
+                urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
 
         let (pc, offer_sdp) = rt.block_on(async {
             let pc = Arc::new(tokio::sync::Mutex::new(
                 api.new_peer_connection(config).await.map_err(|e| e.to_string())?
             ));
+
+            // Register ICE callbacks BEFORE set_local_description (which triggers gathering)
+            let (ice_done_tx, mut ice_done_rx) = tokio::sync::mpsc::unbounded_channel();
+            {
+                let pc_ref = pc.lock().await;
+                pc_ref.on_ice_connection_state_change(Box::new(move |state| {
+                    eprintln!("  ICE state: {:?}", state);
+                    Box::pin(async {})
+                }));
+                pc_ref.on_ice_candidate(Box::new(move |c| {
+                    let tx = ice_done_tx.clone();
+                    Box::pin(async move {
+                        if c.is_none() {
+                            let _ = tx.send(());
+                        }
+                    })
+                }));
+            }
 
             {
                 let rtp_sender = pc.lock().await
@@ -84,24 +109,12 @@ impl WebRtcHandle {
                 .await
                 .map_err(|e| e.to_string())?;
 
+            // Now set local description (triggers ICE gathering, callback is already registered)
             pc.lock().await
                 .set_local_description(offer.clone())
                 .await
                 .map_err(|e| e.to_string())?;
 
-            // Wait for ICE gathering complete using a callback
-            let (ice_done_tx, mut ice_done_rx) = tokio::sync::mpsc::unbounded_channel();
-            {
-                let pc_ref = pc.lock().await;
-                pc_ref.on_ice_candidate(Box::new(move |c| {
-                    let tx = ice_done_tx.clone();
-                    Box::pin(async move {
-                        if c.is_none() { // GatheringComplete
-                            let _ = tx.send(());
-                        }
-                    })
-                }));
-            }
             // Wait for gathering complete with timeout
             tokio::time::timeout(Duration::from_secs(3), ice_done_rx.recv()).await.ok();
 
@@ -137,15 +150,15 @@ impl WebRtcHandle {
         })
     }
 
-    pub fn add_candidate(&self, candidate: &str) -> Result<(), String> {
+    pub fn add_candidate(&self, candidate: &str, sdp_mid: Option<String>, sdp_mline_index: Option<u16>) -> Result<(), String> {
         let pc = self.pc.clone();
         let c = candidate.to_string();
         self._rt.block_on(async {
             use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
             let init = RTCIceCandidateInit {
                 candidate: c,
-                sdp_mid: None,
-                sdp_mline_index: None,
+                sdp_mid,
+                sdp_mline_index,
                 username_fragment: None,
             };
             pc.lock().await.add_ice_candidate(init).await.map_err(|e| e.to_string())
@@ -176,5 +189,11 @@ impl WebRtcHandle {
         self._rt.block_on(async move {
             track.write_sample(&sample).await.map_err(|e| e.to_string())
         })
+    }
+
+    pub fn close(&self) {
+        let _ = self._rt.block_on(async {
+            self.pc.lock().await.close().await.ok();
+        });
     }
 }

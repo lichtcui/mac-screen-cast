@@ -16,6 +16,9 @@ use core_graphics::context::{CGContext, CGInterpolationQuality};
 use core_graphics::geometry::{CGRect, CGPoint, CGSize};
 
 fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+        .format_timestamp_millis()
+        .init();
     let args: Vec<String> = std::env::args().collect();
     let mut wid: u32 = 0;
     let mut max_w: u32 = 1280;
@@ -94,6 +97,19 @@ fn main() {
                 "/" => Response::from_data(server::html(fps).into_bytes())
                     .with_header("Content-Type: text/html; charset=utf-8".parse::<Header>().unwrap()),
                 "/offer" => {
+                    // If the offer has been consumed by a previous signal, recreate
+                    if srv_wr_conn.load(Ordering::Relaxed) {
+                        // Close old connection
+                        if let Some(ref wr) = *srv_wr.lock().unwrap() {
+                            wr.close();
+                        }
+                        srv_wr_conn.store(false, Ordering::Relaxed);
+                        // Create fresh handle (blocks ~3s for ICE gathering)
+                        if let Ok(new_handle) = webrtc::WebRtcHandle::new(svr_s.clone()) {
+                            *srv_wr.lock().unwrap() = Some(new_handle);
+                            eprintln!("  WebRTC offer recreated");
+                        }
+                    }
                     match srv_wr.lock().unwrap().as_ref() {
                         Some(wr) => Response::from_data(wr.offer.clone().into_bytes())
                             .with_header("Content-Type: application/sdp".parse::<Header>().unwrap()),
@@ -109,13 +125,16 @@ fn main() {
                                     let _ = wr.set_answer(sdp.to_string());
                                     if let Some(cands) = v["candidates"].as_array() {
                                         for c in cands {
-                                            if let Some(cs) = c.as_str() {
-                                                let _ = wr.add_candidate(cs);
+                                            let cs = c["candidate"].as_str().unwrap_or("");
+                                            if !cs.is_empty() {
+                                                let sdp_mid = c["sdpMid"].as_str().map(|s| s.to_string());
+                                                let sdp_mline_index = c["sdpMLineIndex"].as_u64().map(|n| n as u16);
+                                                let _ = wr.add_candidate(cs, sdp_mid, sdp_mline_index);
                                             }
                                         }
                                     }
                                     srv_wr_conn.store(true, Ordering::Relaxed);
-                                    eprintln!("  WebRTC connected");
+                                    eprintln!("  Signal exchange complete");
                                 }
                             }
                         }
