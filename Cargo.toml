@@ -2,6 +2,11 @@
 name = "mac-screen-cast"
 version = "0.1.0"
 edition = "2021"
+description = "Stream macOS screen to browser via H.264 hardware encoding and WebRTC"
+license = "MIT"
+repository = "https://github.com/lichtcui/mac-screen-cast"
+keywords = ["macos", "screen-capture", "webRTC", "h264", "videotoolbox"]
+categories = ["multimedia::video", "command-line-utilities"]
 
 [dependencies]
 tiny_http = "0.12"
