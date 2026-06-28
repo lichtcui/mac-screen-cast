@@ -52,7 +52,7 @@ fn main() {
                 return;
             }
             "-h" | "--help" => {
-                println!("screenstream [-l] [-w <id>] [--width <px>] [--fps <1-60>] [--port <n>]");
+                println!("mac-cast [-l] [-w <id>] [--width <px>] [--fps <1-60>] [--port <n>]");
                 return;
             }
             _ => {}

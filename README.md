@@ -1,4 +1,4 @@
-# screenstream
+# mac-cast
 
 macOS 屏幕采集 + H.264 硬件编码 + WebRTC 推流到浏览器。
 
