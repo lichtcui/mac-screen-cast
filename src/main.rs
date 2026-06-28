@@ -16,9 +16,6 @@ use core_graphics::context::{CGContext, CGInterpolationQuality};
 use core_graphics::geometry::{CGRect, CGPoint, CGSize};
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
-        .format_timestamp_millis()
-        .init();
     let args: Vec<String> = std::env::args().collect();
     let mut wid: u32 = 0;
     let mut max_w: u32 = 1280;
