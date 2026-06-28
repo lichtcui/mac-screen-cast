@@ -6,7 +6,7 @@ macOS 屏幕采集 + H.264 硬件编码 + WebRTC 推流到浏览器。
 
 - **VideoToolbox H.264 硬件编码**：通过 Apple VideoToolbox 框架调用 GPU 进行 H.264 编码，相比软件编码大幅降低 CPU 占用，是实现低延迟高帧率推流的关键
 - **ScreenCaptureKit 屏幕捕获**：使用 macOS ScreenCaptureKit 框架采集窗口，零 CPU 拷贝直接传递 `CVPixelBuffer` 到 VideoToolbox
-- **WebRTC 推流**：使用 webrtc-rs 实现低延迟流媒体传输，浏览器端通过 WebSocket 信令 + WebRTC 播放
+- **WebRTC 推流**：使用 [rustrtc](https://github.com/restsend/rustrtc) 实现低延迟流媒体传输，浏览器端通过 WebSocket 信令 + WebRTC 播放
 
 ## 使用
 
@@ -32,5 +32,5 @@ cargo run -- -w <window-id> --width 1280 --fps 30
 ## 依赖
 
 - macOS (VideoToolbox, ScreenCaptureKit, CoreMedia, CoreVideo)
-- [webrtc-rs](https://github.com/webrtc-rs/webrtc)
+- [rustrtc](https://github.com/restsend/rustrtc) (v0.3.x) — 纯 Rust WebRTC 实现
 - [screencapturekit-rs](https://github.com/doom-fish/screencapturekit-rs) (v8.0.0) — ScreenCaptureKit Rust 绑定

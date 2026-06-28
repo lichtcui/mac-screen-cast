@@ -14,6 +14,12 @@ This project uses [rustrtc](https://github.com/restsend/rustrtc) (v0.3.x). When 
 - `PeerConnection` is `Clone` (internally `Arc`), no mutex wrapping needed.
 - Requires `rustls::crypto::CryptoProvider::install_default()` before first `PeerConnection::new()`.
 
+### Reference
+
+- [rustrtc GitHub repo](https://github.com/restsend/rustrtc) — pure-Rust WebRTC implementation
+- [docs.rs/rustrtc](https://docs.rs/rustrtc/latest/rustrtc/) — API docs
+- [RFC 6184](https://datatracker.ietf.org/doc/html/rfc6184) — RTP payload format for H.264 video (FU-A fragmentation)
+
 ## Screen Capture
 
 This project uses [screencapturekit-rs](https://github.com/doom-fish/screencapturekit-rs) (v8.0.0) by doom-fish for macOS screen capture via ScreenCaptureKit.
