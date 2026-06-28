@@ -75,9 +75,11 @@ impl VtEncoder {
             }
         }
 
-        let (sps, pps) = {
+        let (sps, pps) = if is_keyframe {
             let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             (cache.sps.clone(), cache.pps.clone())
+        } else {
+            (None, None)
         };
 
         Ok(H264Frame {

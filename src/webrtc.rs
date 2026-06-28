@@ -147,20 +147,19 @@ impl WebRtcHandle {
 
         let source = self.sample_source.clone();
         self.rt.block_on(async move {
-            for (nal_data, is_last_nal) in &nal_units {
+            for (nal_data, is_last_nal) in nal_units {
                 if nal_data.is_empty() {
                     continue;
                 }
                 let nal_header = nal_data[0];
-                let nal_payload = &nal_data[1..];
-                let total_size = 1 + nal_payload.len();
+                let total_size = nal_data.len();
 
                 if total_size <= RTP_MTU {
                     source
                         .send_video(VideoFrame {
                             rtp_timestamp: ts,
-                            data: Bytes::from(nal_data.clone()),
-                            is_last_packet: *is_last_nal,
+                            data: Bytes::from(nal_data),
+                            is_last_packet: is_last_nal,
                             ..Default::default()
                         })
                         .await
@@ -169,13 +168,13 @@ impl WebRtcHandle {
                     let fu_indicator = 0x1c | (nal_header & 0x60);
                     let nal_type = nal_header & 0x1f;
                     let max_chunk = RTP_MTU - 2;
-                    let mut offset = 0;
+                    let mut offset = 1; // skip NAL header byte
 
-                    while offset < nal_payload.len() {
-                        let chunk_end = (offset + max_chunk).min(nal_payload.len());
-                        let chunk = &nal_payload[offset..chunk_end];
-                        let is_first = offset == 0;
-                        let is_last = chunk_end >= nal_payload.len();
+                    while offset < nal_data.len() {
+                        let chunk_end = (offset + max_chunk).min(nal_data.len());
+                        let chunk = &nal_data[offset..chunk_end];
+                        let is_first = offset == 1;
+                        let is_last = chunk_end >= nal_data.len();
 
                         let fu_header = (if is_first { 0x80 } else { 0 })
                             | (if is_last { 0x40 } else { 0 })
@@ -190,7 +189,7 @@ impl WebRtcHandle {
                             .send_video(VideoFrame {
                                 rtp_timestamp: ts,
                                 data: Bytes::from(fu_payload),
-                                is_last_packet: is_last && *is_last_nal,
+                                is_last_packet: is_last && is_last_nal,
                                 ..Default::default()
                             })
                             .await
