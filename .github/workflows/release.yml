@@ -21,7 +21,7 @@ env:
 jobs:
   check:
     name: Check & Lint & Test
-    runs-on: macos-15
+    runs-on: macos-14
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +60,7 @@ jobs:
 
   build-release:
     name: Build Release Binary
-    runs-on: macos-15
+    runs-on: macos-14
     needs: [check, audit]
     timeout-minutes: 30
     steps:
