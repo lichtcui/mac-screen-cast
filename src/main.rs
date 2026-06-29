@@ -22,6 +22,7 @@ fn main() {
     );
     let args: Vec<String> = std::env::args().collect();
     let mut wid: u32 = 0;
+    let mut window_name = String::from("mac-screen-cast");
     let mut max_w: u32 = 1280;
     let mut fps: u32 = 30;
     let mut port: u16 = 8080;
@@ -121,6 +122,7 @@ fn main() {
         if let Ok(n) = s.trim().parse::<usize>() {
             if n >= 1 && n <= uq.len() {
                 wid = uq[n - 1].id;
+                window_name = format!("{} - {}", uq[n - 1].app, uq[n - 1].title);
             }
         }
         if wid == 0 {
@@ -265,7 +267,7 @@ fn main() {
             let path = url.split('?').next().unwrap_or("/");
 
             let resp = match path {
-                "/" => Response::from_data(server::html(fps).into_bytes())
+                "/" => Response::from_data(server::html(fps, &window_name).into_bytes())
                     .with_header(
                         "Content-Type: text/html; charset=utf-8"
                             .parse::<Header>()
