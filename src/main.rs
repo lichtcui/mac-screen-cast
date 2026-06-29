@@ -122,7 +122,7 @@ fn main() {
         if let Ok(n) = s.trim().parse::<usize>() {
             if n >= 1 && n <= uq.len() {
                 wid = uq[n - 1].id;
-                window_name = format!("{} - {}", uq[n - 1].app, uq[n - 1].title);
+                window_name = uq[n - 1].app.clone();
             }
         }
         if wid == 0 {
