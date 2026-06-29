@@ -229,6 +229,30 @@ fn main() {
         };
         eprintln!("\n  WebRTC stream →  http://{}:{}", ip, port);
 
+        if let Ok(qr) = qrcode::QrCode::new(format!("http://{}:{}", ip, port)) {
+            let w = qr.width();
+            let mut out = String::new();
+            let mut y = 0usize;
+            out.push_str("  \n");
+            while y < w {
+                out.push_str("  ");
+                for x in 0..w {
+                    let top = qr[(x, y)] != qrcode::Color::Light;
+                    let bot = y + 1 < w && qr[(x, y + 1)] != qrcode::Color::Light;
+                    out.push(match (top, bot) {
+                        (true,  true)  => '█',
+                        (true,  false) => '▀',
+                        (false, true)  => '▄',
+                        (false, false) => ' ',
+                    });
+                }
+                out.push_str("  \n");
+                y += 2;
+            }
+            out.push_str("  \n");
+            eprintln!("{}", out);
+        }
+
         loop {
             if svr_s.load(Ordering::Relaxed) {
                 break;
