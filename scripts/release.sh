@@ -12,6 +12,7 @@ NC='\033[0m' # No Color
 
 STEP=0
 TOTAL=10
+TARGETS=("aarch64-apple-darwin" "x86_64-apple-darwin")
 
 info()  { echo -e "${BLUE}[INFO]${NC} $*"; }
 step()  { STEP=$((STEP + 1)); echo; echo -e "${YELLOW}[${STEP}/${TOTAL}]${NC} ${BOLD}$*${NC}"; SECONDS=0; }
@@ -128,6 +129,13 @@ pre_check() {
     command -v gh >/dev/null 2>&1 || fail "GitHub CLI (gh) not found. Install from https://cli.github.com"
     command -v cargo-audit >/dev/null 2>&1 || fail "cargo-audit not found. Run: cargo install cargo-audit --locked"
 
+    # Rust targets for dual-arch build
+    for t in "${TARGETS[@]}"; do
+        if ! rustup target list --installed | grep -q "$t"; then
+            fail "Rust target $t not installed. Run: rustup target add $t"
+        fi
+    done
+
     # Git tag
     if git tag -l "$VERSION" | grep -q .; then
         fail "Tag $VERSION already exists"
@@ -176,18 +184,24 @@ step_audit() {
 }
 
 step_build() {
-    step "Build release binary"
-    cargo build --release
-    ok "Build complete"
+    step "Build release binaries (${TARGETS[*]})"
+    for t in "${TARGETS[@]}"; do
+        info "Building for $t ..."
+        cargo build --release --target "$t"
+    done
+    ok "Build complete for all targets"
 }
 
 step_package() {
-    step "Copy binary to packages/"
-    local dest="packages/mac-screen-cast-${VERSION}"
-    cp target/release/mac-screen-cast "$dest"
-    chmod +x "$dest"
-    ls -lh "$dest"
-    ok "Binary copied to $dest"
+    step "Copy binaries to packages/"
+    for t in "${TARGETS[@]}"; do
+        local src="target/$t/release/mac-screen-cast"
+        local dest="packages/mac-screen-cast-${VERSION}-${t}"
+        cp "$src" "$dest"
+        chmod +x "$dest"
+        ls -lh "$dest"
+    done
+    ok "Binaries copied to packages/"
 }
 
 step_version() {
@@ -264,7 +278,7 @@ step_publish_cratesio() {
 step_release() {
     step "Create GitHub Release"
     if $DRY_RUN; then
-        skip "Dry-run: would create GitHub Release $VERSION and upload target/release/mac-screen-cast"
+        skip "Dry-run: would create GitHub Release $VERSION and upload binaries for all targets"
         return
     fi
 
@@ -278,12 +292,22 @@ step_release() {
         repo_args="--repo $fork_repo"
     fi
 
+    # Collect all binary paths (rename with arch suffix to avoid conflicts)
+    local assets=()
+    for t in "${TARGETS[@]}"; do
+        local src="target/$t/release/mac-screen-cast"
+        local name="mac-screen-cast-${t}"
+        cp "$src" "/tmp/$name"
+        chmod +x "/tmp/$name"
+        assets+=("/tmp/$name")
+    done
+
     # shellcheck disable=SC2086
     gh release create "$VERSION" \
         $repo_args \
         --title "$VERSION" \
         --generate-notes \
-        target/release/mac-screen-cast
+        "${assets[@]}"
     ok "GitHub Release $VERSION created"
 }
 
@@ -304,7 +328,9 @@ dry_run_summary() {
     fi
     echo -e "${BOLD}║${NC}    - Published: crates.io"
     echo -e "${BOLD}║${NC}    - Created: GitHub Release ${VERSION}"
-    echo -e "${BOLD}║${NC}    - Uploaded: target/release/mac-screen-cast"
+    for t in "${TARGETS[@]}"; do
+        echo -e "${BOLD}║${NC}    - Uploaded: target/$t/release/mac-screen-cast"
+    done
     echo -e "${BOLD}╚═══════════════════════════════════════╝${NC}"
 }
 
