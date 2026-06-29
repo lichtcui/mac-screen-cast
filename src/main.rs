@@ -1,6 +1,7 @@
 mod capture;
 mod h264;
 mod server;
+mod update_checker;
 mod webrtc;
 
 use std::io::Write;
@@ -17,6 +18,8 @@ fn lock_mutex<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
 }
 
 fn main() {
+    update_checker::check();
+
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::ring::default_provider(),
     );

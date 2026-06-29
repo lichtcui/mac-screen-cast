@@ -21,6 +21,7 @@ screencapturekit = "8"
 videotoolbox = "0.18"
 apple-cf = { version = "0.9", default-features = false, features = ["iosurface"] }
 qrcode = "0.14"
+ureq = "2"
 
 [profile.release]
 opt-level = 3
