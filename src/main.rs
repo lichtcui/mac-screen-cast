@@ -17,9 +17,8 @@ fn lock_mutex<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
 }
 
 fn main() {
-    let _ = rustls::crypto::CryptoProvider::install_default(
-        rustls::crypto::ring::default_provider(),
-    );
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
     let args: Vec<String> = std::env::args().collect();
     let mut wid: u32 = 0;
     let mut max_w: u32 = 1280;
@@ -72,9 +71,15 @@ fn main() {
                 eprintln!();
                 eprintln!("OPTIONS");
                 eprintln!("  -w, --window-id  Window ID to capture                    [env: none]");
-                eprintln!("      --width      Max output width in pixels              [default: 1280]");
-                eprintln!("      --fps        Target frame rate (1-60)                [default: 30]");
-                eprintln!("      --port       HTTP server port                        [default: 8080]");
+                eprintln!(
+                    "      --width      Max output width in pixels              [default: 1280]"
+                );
+                eprintln!(
+                    "      --fps        Target frame rate (1-60)                [default: 30]"
+                );
+                eprintln!(
+                    "      --port       HTTP server port                        [default: 8080]"
+                );
                 eprintln!();
                 eprintln!("EXAMPLES");
                 eprintln!("  mac-screen-cast -l --json              List windows as JSON");
@@ -111,7 +116,11 @@ fn main() {
                 "  [{:2}] {} - {}",
                 j + 1,
                 w.app,
-                if w.title.len() > 55 { &w.title[..55] } else { &w.title }
+                if w.title.len() > 55 {
+                    &w.title[..55]
+                } else {
+                    &w.title
+                }
             );
         }
         print!("Select window (1-{}): ", uq.len());
@@ -205,9 +214,8 @@ fn main() {
     let latest_latency = Arc::new(AtomicU64::new(0));
 
     // ── WebRTC ──
-    let webrtc_rt = Arc::new(
-        tokio::runtime::Runtime::new().expect("create Tokio runtime for WebRTC"),
-    );
+    let webrtc_rt =
+        Arc::new(tokio::runtime::Runtime::new().expect("create Tokio runtime for WebRTC"));
     let wr_handle: Arc<Mutex<Option<webrtc::WebRtcHandle>>> = Arc::new(Mutex::new(None));
     let webrtc_connected = Arc::new(AtomicBool::new(false));
     let srv_wr = wr_handle.clone();
@@ -241,12 +249,11 @@ fn main() {
             let path = url.split('?').next().unwrap_or("/");
 
             let resp = match path {
-                "/" => Response::from_data(server::html(fps).into_bytes())
-                    .with_header(
-                        "Content-Type: text/html; charset=utf-8"
-                            .parse::<Header>()
-                            .unwrap(),
-                    ),
+                "/" => Response::from_data(server::html(fps).into_bytes()).with_header(
+                    "Content-Type: text/html; charset=utf-8"
+                        .parse::<Header>()
+                        .unwrap(),
+                ),
                 "/offer" => {
                     // Refresh: close old PeerConnection, create new one
                     let was_connected = srv_wr_conn.swap(false, Ordering::Relaxed);
@@ -269,12 +276,9 @@ fn main() {
                         }
                     }
                     match lock_mutex(&srv_wr).as_ref() {
-                        Some(wr) => Response::from_data(wr.offer.clone().into_bytes())
-                            .with_header(
-                                "Content-Type: application/sdp"
-                                    .parse::<Header>()
-                                    .unwrap(),
-                            ),
+                        Some(wr) => Response::from_data(wr.offer.clone().into_bytes()).with_header(
+                            "Content-Type: application/sdp".parse::<Header>().unwrap(),
+                        ),
                         None => Response::from_data(Vec::from("not ready")).with_status_code(503),
                     }
                 }
@@ -293,11 +297,8 @@ fn main() {
                                                     c["sdpMid"].as_str().map(|s| s.to_string());
                                                 let sdp_mline_index =
                                                     c["sdpMLineIndex"].as_u64().map(|n| n as u16);
-                                                let _ = wr.add_candidate(
-                                                    cs,
-                                                    sdp_mid,
-                                                    sdp_mline_index,
-                                                );
+                                                let _ =
+                                                    wr.add_candidate(cs, sdp_mid, sdp_mline_index);
                                             }
                                         }
                                     }

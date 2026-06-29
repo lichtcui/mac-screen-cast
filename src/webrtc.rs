@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rustrtc::config::MediaCapabilities;
-use rustrtc::media::{MediaKind, VideoFrame, sample_track};
+use rustrtc::media::{sample_track, MediaKind, VideoFrame};
 use rustrtc::{
-    IceCandidate, PeerConnection, RtcConfiguration, IceServer, RtpCodecParameters,
-    SdpType, SessionDescription,
+    IceCandidate, IceServer, PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType,
+    SessionDescription,
 };
 use tokio::runtime::Handle;
 
@@ -39,7 +39,7 @@ impl WebRtcHandle {
 
             let config = RtcConfiguration {
                 ice_servers: vec![IceServer::new(vec![
-                    "stun:stun.l.google.com:19302".to_owned(),
+                    "stun:stun.l.google.com:19302".to_owned()
                 ])],
                 media_capabilities: Some(caps),
                 ..Default::default()
@@ -60,8 +60,7 @@ impl WebRtcHandle {
             .map_err(|e| e.to_string())?;
 
             let offer = pc.create_offer().await.map_err(|e| e.to_string())?;
-            pc.set_local_description(offer)
-                .map_err(|e| e.to_string())?;
+            pc.set_local_description(offer).map_err(|e| e.to_string())?;
 
             tokio::time::timeout(Duration::from_secs(3), pc.wait_for_gathering_complete())
                 .await
@@ -97,8 +96,8 @@ impl WebRtcHandle {
     pub fn set_answer(&self, answer_sdp: String) -> Result<(), String> {
         let pc = self.pc.clone();
         self.rt.block_on(async {
-            let answer =
-                SessionDescription::parse(SdpType::Answer, &answer_sdp).map_err(|e| e.to_string())?;
+            let answer = SessionDescription::parse(SdpType::Answer, &answer_sdp)
+                .map_err(|e| e.to_string())?;
             pc.set_remote_description(answer)
                 .await
                 .map_err(|e| e.to_string())
@@ -172,11 +171,7 @@ impl WebRtcHandle {
 ///
 /// NAL units smaller than `mtu` are sent as a single packet.
 /// Larger units are fragmented using FU-A (RFC 6184).
-pub(crate) fn packetize_nal(
-    data: Vec<u8>,
-    is_last_nal: bool,
-    mtu: usize,
-) -> Vec<(Vec<u8>, bool)> {
+pub(crate) fn packetize_nal(data: Vec<u8>, is_last_nal: bool, mtu: usize) -> Vec<(Vec<u8>, bool)> {
     if data.is_empty() {
         return vec![];
     }
@@ -194,9 +189,8 @@ pub(crate) fn packetize_nal(
         let chunk = &data[offset..chunk_end];
         let is_first = offset == 1;
         let is_last = chunk_end >= data.len();
-        let fu_header = (if is_first { 0x80 } else { 0 })
-            | (if is_last { 0x40 } else { 0 })
-            | nal_type;
+        let fu_header =
+            (if is_first { 0x80 } else { 0 }) | (if is_last { 0x40 } else { 0 }) | nal_type;
         let mut payload = Vec::with_capacity(2 + chunk.len());
         payload.push(fu_indicator);
         payload.push(fu_header);
@@ -247,7 +241,11 @@ mod tests {
         let mut nal = vec![nal_type];
         nal.extend(std::iter::repeat(0xFF).take(2400));
         let packets = packetize_nal(nal, true, 1200);
-        assert!(packets.len() >= 2, "should be fragmented into {} packets", packets.len());
+        assert!(
+            packets.len() >= 2,
+            "should be fragmented into {} packets",
+            packets.len()
+        );
         // All packets ≤ MTU
         for p in &packets {
             assert!(p.0.len() <= 1200, "packet too large: {}", p.0.len());

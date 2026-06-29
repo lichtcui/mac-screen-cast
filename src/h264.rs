@@ -50,7 +50,10 @@ impl VtEncoder {
             .map_err(|e| format!("CompressionSession init failed: {}", e))?;
         Ok(VtEncoder {
             session,
-            cache: Mutex::new(SpsPpsCache { sps: None, pps: None }),
+            cache: Mutex::new(SpsPpsCache {
+                sps: None,
+                pps: None,
+            }),
         })
     }
 
@@ -99,9 +102,9 @@ fn extract_sps_pps(encoded: &EncodedFrame) -> (Option<Vec<u8>>, Option<Vec<u8>>)
 
     // SAFETY: CMSampleBufferGetFormatDescription is a CoreMedia C API.
     // `sb` is a valid CMSampleBuffer from the encoder output (checked above).
-    let fmt_desc: *mut c_void = unsafe {
-        videotoolbox::ffi::CMSampleBufferGetFormatDescription(sb.as_ptr().cast())
-    } as *mut c_void;
+    let fmt_desc: *mut c_void =
+        unsafe { videotoolbox::ffi::CMSampleBufferGetFormatDescription(sb.as_ptr().cast()) }
+            as *mut c_void;
     if fmt_desc.is_null() {
         return (None, None);
     }
@@ -157,12 +160,8 @@ fn extract_sps_pps(encoded: &EncodedFrame) -> (Option<Vec<u8>>, Option<Vec<u8>>)
 fn scan_for_idr(data: &[u8]) -> bool {
     let mut pos = 0;
     while pos + 5 <= data.len() {
-        let nal_sz = u32::from_be_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-        ]) as usize;
+        let nal_sz =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         if nal_sz == 0 || pos + 4 + nal_sz > data.len() {
             break;
         }
@@ -180,12 +179,8 @@ pub fn avcc_nal_units(data: &[u8]) -> Vec<(Vec<u8>, bool)> {
     let mut units = Vec::new();
     let mut pos = 0;
     while pos + 4 <= data.len() {
-        let nal_size = u32::from_be_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-        ]) as usize;
+        let nal_size =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
         if nal_size == 0 || pos + nal_size > data.len() {
             break;
@@ -245,7 +240,9 @@ mod tests {
     #[test]
     fn avcc_nal_units_zero_length() {
         // Zero-length NAL at the end should stop parsing
-        let data = [0x00, 0x00, 0x00, 0x05, 0x41, 0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00];
+        let data = [
+            0x00, 0x00, 0x00, 0x05, 0x41, 0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00,
+        ];
         let units = avcc_nal_units(&data);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].0, &[0x41, 0x01, 0x02, 0x03, 0x04]);

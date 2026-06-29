@@ -23,11 +23,24 @@ for x in w { if let n = x[kCGWindowName as String] as? String, !n.isEmpty,
         Ok(o) => o,
         Err(_) => return Vec::new(),
     };
-    if !out.status.success() { return Vec::new(); }
-    String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| {
-        let p: Vec<&str> = l.trim().split(" ||| ").collect();
-        if p.len() >= 3 { Some(Window { id: p[0].parse().ok()?, app: p[1].into(), title: p[2].into() }) } else { None }
-    }).collect()
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let p: Vec<&str> = l.trim().split(" ||| ").collect();
+            if p.len() >= 3 {
+                Some(Window {
+                    id: p[0].parse().ok()?,
+                    app: p[1].into(),
+                    title: p[2].into(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// List windows as JSON array.
@@ -65,8 +78,12 @@ fetch('/signal',{method:'POST',body:JSON.stringify(msg)})
 
 /// Get local IP address.
 pub fn get_ip() -> String {
-    Command::new("sh").arg("-c").arg("ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1")
-        .output().map(|o| String::from_utf8_lossy(&o.stdout).trim().into()).unwrap_or_default()
+    Command::new("sh")
+        .arg("-c")
+        .arg("ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().into())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
