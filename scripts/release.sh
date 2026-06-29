@@ -224,9 +224,27 @@ step_push() {
         skip "Dry-run: would push master and $VERSION to $remote"
         return
     fi
-    git push "$remote" master
+
+    # Try pushing master first; protected branches may require a PR
+    if git push "$remote" master 2>/dev/null; then
+        ok "Pushed master to $remote"
+    else
+        info "Master push rejected (likely branch protection). Creating PR..."
+        local branch="chore/release-${VERSION}"
+        git push "$remote" "master:${branch}" 2>/dev/null || {
+            # Branch may already exist, force push
+            git push "$remote" "master:${branch}" --force 2>/dev/null
+        }
+        gh pr create \
+            --repo "$(git remote get-url "$remote" | sed 's|https://github.com/||; s|\.git$||')" \
+            --title "chore: release ${VERSION}" \
+            --body "Version bump for ${VERSION} release." \
+            --base master --head "$branch" 2>&1 | head -1
+        info "PR created for version bump merge"
+    fi
+
     git push "$remote" "$VERSION"
-    ok "Pushed master and $VERSION to $remote"
+    ok "Pushed tag $VERSION to $remote"
 }
 
 step_publish_cratesio() {
