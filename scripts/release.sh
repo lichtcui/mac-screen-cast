@@ -52,6 +52,7 @@ HELP
 DRY_RUN=false
 FORK_MODE=false
 FORK_REMOTE=""
+REMOTE="origin"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
