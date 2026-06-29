@@ -33,6 +33,39 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Fetch dependencies
+        run: cargo fetch
+
+      - name: Patch apple-metal Swift for macOS 26
+        run: |
+          DIR=$(find ~/.cargo/registry/src -type d -path "*/apple-metal-*/AppleMetalBridge" | head -1)
+          if [ -z "$DIR" ]; then echo "ERROR: apple-metal not found"; exit 1; fi
+          python3 -c "
+import os
+d = '$DIR'
+for fn in sorted(os.listdir(d)):
+    if not fn.endswith('.swift'): continue
+    fp = os.path.join(d, fn)
+    with open(fp) as f: lines = f.readlines()
+    out, i = [], 0
+    while i < len(lines):
+        if '#available(macOS 26' in lines[i]:
+            out.append(lines[i])
+            i += 1
+            depth = 1
+            while i < len(lines) and depth > 0:
+                depth += lines[i].count('{') - lines[i].count('}')
+                if depth > 0:
+                    out.append('// CI_PATCH: ' + lines[i])
+                else:
+                    out.append(lines[i])
+                i += 1
+            continue
+        out.append(lines[i]); i += 1
+    with open(fp, 'w') as f: f.writelines(out)
+    print(f'  patched {fn}')
+"
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -70,6 +103,39 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch dependencies
+        run: cargo fetch
+
+      - name: Patch apple-metal Swift for macOS 26
+        run: |
+          DIR=$(find ~/.cargo/registry/src -type d -path "*/apple-metal-*/AppleMetalBridge" | head -1)
+          if [ -z "$DIR" ]; then echo "ERROR: apple-metal not found"; exit 1; fi
+          python3 -c "
+import os
+d = '$DIR'
+for fn in sorted(os.listdir(d)):
+    if not fn.endswith('.swift'): continue
+    fp = os.path.join(d, fn)
+    with open(fp) as f: lines = f.readlines()
+    out, i = [], 0
+    while i < len(lines):
+        if '#available(macOS 26' in lines[i]:
+            out.append(lines[i])
+            i += 1
+            depth = 1
+            while i < len(lines) and depth > 0:
+                depth += lines[i].count('{') - lines[i].count('}')
+                if depth > 0:
+                    out.append('// CI_PATCH: ' + lines[i])
+                else:
+                    out.append(lines[i])
+                i += 1
+            continue
+        out.append(lines[i]); i += 1
+    with open(fp, 'w') as f: f.writelines(out)
+    print(f'  patched {fn}')
+"
 
       - name: Build release
         run: cargo build --release
