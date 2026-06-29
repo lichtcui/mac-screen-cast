@@ -11,7 +11,7 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 STEP=0
-TOTAL=9
+TOTAL=10
 
 info()  { echo -e "${BLUE}[INFO]${NC} $*"; }
 step()  { STEP=$((STEP + 1)); echo; echo -e "${YELLOW}[${STEP}/${TOTAL}]${NC} ${BOLD}$*${NC}"; SECONDS=0; }
