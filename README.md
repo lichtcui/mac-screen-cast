@@ -22,9 +22,29 @@ Alternatively, grant manually in **System Settings > Privacy & Security > Screen
 
 ## Installation
 
+### From source (cargo)
+
 ```bash
 cargo install mac-screen-cast
 ```
+
+### Pre-built binary (macOS)
+
+Download the latest binary for your architecture from [GitHub Releases](https://github.com/lichtcui/mac-screen-cast/releases):
+
+```bash
+# Download (example: x86_64)
+curl -LO https://github.com/lichtcui/mac-screen-cast/releases/latest/download/mac-screen-cast-x86_64-apple-darwin
+
+# Remove quarantine attribute (Gatekeeper bypass)
+xattr -d com.apple.quarantine mac-screen-cast-*
+
+# Make executable and run
+chmod +x mac-screen-cast-*
+./mac-screen-cast-*
+```
+
+> **Why `xattr -d`?** macOS automatically adds a `com.apple.quarantine` flag to files downloaded via a browser. This triggers Gatekeeper, which blocks unsigned binaries from opening. Removing the attribute tells macOS the file is safe to run locally. This is standard practice for unsigned open-source macOS tools.
 
 ## Usage
 

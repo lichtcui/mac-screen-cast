@@ -193,15 +193,16 @@ step_build() {
 }
 
 step_package() {
-    step "Copy binaries to packages/"
+    step "Copy binaries to packages/ and ad-hoc sign"
     for t in "${TARGETS[@]}"; do
         local src="target/$t/release/mac-screen-cast"
         local dest="packages/mac-screen-cast-${VERSION}-${t}"
         cp "$src" "$dest"
         chmod +x "$dest"
+        codesign --force -s - "$dest"
         ls -lh "$dest"
     done
-    ok "Binaries copied to packages/"
+    ok "Binaries copied to packages/ and ad-hoc signed"
 }
 
 step_version() {
