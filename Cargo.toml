@@ -1,6 +1,6 @@
 [package]
 name = "mac-screen-cast"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Stream macOS screen to browser over LAN. Zero-copy ScreenCaptureKit, hardware H.264 encoding via VideoToolbox, ~10ms pipeline latency, ~3% CPU."
 license = "MIT"
