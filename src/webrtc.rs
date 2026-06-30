@@ -6,7 +6,7 @@ use bytes::Bytes;
 use rustrtc::config::MediaCapabilities;
 use rustrtc::media::{MediaKind, VideoFrame, sample_track};
 use rustrtc::{
-    IceCandidate, PeerConnection, RtcConfiguration, IceServer, RtpCodecParameters,
+    IceCandidate, PeerConnection, RtcConfiguration, RtpCodecParameters,
     SdpType, SessionDescription,
 };
 use tokio::runtime::Handle;
@@ -38,9 +38,7 @@ impl WebRtcHandle {
             caps.video = vec![h264];
 
             let config = RtcConfiguration {
-                ice_servers: vec![IceServer::new(vec![
-                    "stun:stun.l.google.com:19302".to_owned(),
-                ])],
+                ice_servers: vec![],
                 media_capabilities: Some(caps),
                 ..Default::default()
             };
