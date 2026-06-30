@@ -8,17 +8,8 @@ Stream macOS screen to browser over LAN. Uses ScreenCaptureKit for zero-copy cap
 
 ## Requirements
 
-- macOS 12.3+
-- Screen Recording permission
-
-Running the tool will automatically prompt for permission. If denied, reset and re-trigger:
-
-```bash
-tccutil reset ScreenCapture
-mac-screen-cast -l
-```
-
-Alternatively, grant manually in **System Settings > Privacy & Security > Screen Recording**.
+- **macOS 12.3+** — ScreenCaptureKit availability
+- **Screen Recording permission** — required by macOS for screen capture
 
 ## Installation
 
@@ -39,14 +30,30 @@ curl -LO https://github.com/lichtcui/mac-screen-cast/releases/latest/download/ma
 # Remove quarantine attribute (Gatekeeper bypass)
 xattr -d com.apple.quarantine mac-screen-cast-*
 
-# Make executable and run
+# Ad-hoc sign (bypass "Apple could not verify" warning)
+codesign --force -s - mac-screen-cast-*
+
+# Make executable
 chmod +x mac-screen-cast-*
 ./mac-screen-cast-*
 ```
 
-> **Why `xattr -d`?** macOS automatically adds a `com.apple.quarantine` flag to files downloaded via a browser. This triggers Gatekeeper, which blocks unsigned binaries from opening. Removing the attribute tells macOS the file is safe to run locally. This is standard practice for unsigned open-source macOS tools.
+> **Why these steps?** Files downloaded via a browser get a `com.apple.quarantine` flag, triggering Gatekeeper to block unsigned binaries — `xattr -d` removes that flag. On newer macOS versions, even without quarantine, macOS may still refuse to run unsigned binaries with "Apple could not verify" — `codesign --force -s -` creates an ad-hoc signature to satisfy the check. These steps are standard practice for unsigned open-source macOS tools.
 
 ## Usage
+
+### Screen Recording permission
+
+The first run will automatically prompt for permission. If denied, reset and re-trigger:
+
+```bash
+tccutil reset ScreenCapture
+mac-screen-cast -l
+```
+
+Alternatively, grant manually in **System Settings > Privacy & Security > Screen Recording**.
+
+### Basic usage
 
 Just run it — you'll be prompted to pick a window:
 
