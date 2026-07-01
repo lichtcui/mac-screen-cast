@@ -41,7 +41,7 @@ pub fn html(fps: u32, title: &str) -> String {
 	var v=document.getElementById('v'),st=document.getElementById('st'),pc;
 	fetch('/offer').then(r=>r.text()).then(async o=>{
 	pc=new RTCPeerConnection();
-	pc.ontrack=e=>{v.srcObject=e.streams[0];v.onloadedmetadata=()=>st.className='g'};
+	pc.ontrack=e=>{v.srcObject=e.streams[0];v.play().catch(()=>{});v.onloadedmetadata=()=>st.className='g'};
 	pc.oniceconnectionstatechange=()=>{var s=pc.iceConnectionState;st.textContent='{{FPS}}fps '+s;if(s==='failed')console.log('ICE failed')};
 	pc.onicecandidateerror=e=>console.warn('ICE candidate error:',e.errorText||'timeout',e.url||'');
 	setInterval(async()=>{

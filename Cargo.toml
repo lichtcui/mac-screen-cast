@@ -17,7 +17,7 @@ serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
 rustrtc = "0.3"
 rustls = { version = "0.23", features = ["ring"] }
-screencapturekit = "8"
+screencapturekit = { version = "8", features = ["macos_14_0"] }
 videotoolbox = "0.18"
 apple-cf = { version = "0.9", default-features = false, features = ["iosurface"] }
 qrcode = "0.14"

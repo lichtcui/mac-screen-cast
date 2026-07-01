@@ -1,9 +1,23 @@
-use screencapturekit::cm::CMTime;
-use screencapturekit::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
-/// Thin wrapper around an SCStream for capturing a window.
+use screencapturekit::cm::CMSampleBuffer;
+use screencapturekit::prelude::*;
+use screencapturekit::screenshot_manager::SCScreenshotManager;
+use screencapturekit::stream::configuration::SCStreamConfiguration;
+use screencapturekit::stream::content_filter::SCContentFilter;
+
+/// Polling-based window capture using `SCScreenshotManager`.
+///
+/// macOS 26's `SCStream` with `desktopIndependentWindow` returns blank pixel
+/// buffers for certain native-app windows (e.g. Ghostty, Clash Verge).
+/// `SCScreenshotManager` is a different code path that does not have this
+/// limitation.
 pub struct CaptureSession {
-    stream: Option<SCStream>,
+    stop: Arc<AtomicBool>,
+    join_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl CaptureSession {
@@ -12,10 +26,10 @@ impl CaptureSession {
         output_width: u32,
         output_height: u32,
         fps: u32,
-        handler: H,
+        mut handler: H,
     ) -> Result<Self, String>
     where
-        H: SCStreamOutputTrait + 'static,
+        H: FnMut(CMSampleBuffer, SCStreamOutputType) + Send + 'static,
     {
         let content = SCShareableContent::get().map_err(|e| {
             format!(
@@ -40,23 +54,39 @@ impl CaptureSession {
             .set_height(output_height)
             .set_pixel_format(PixelFormat::BGRA)
             .set_shows_cursor(false);
-        config.set_minimum_frame_interval(&CMTime::new(1, fps as i32));
 
-        let mut stream = SCStream::new(&filter, &config);
+        let interval = Duration::from_secs_f64(1.0 / fps as f64);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = stop.clone();
 
-        stream.add_output_handler(handler, SCStreamOutputType::Screen);
-        stream
-            .start_capture()
-            .map_err(|e| format!("SCStream start_capture failed: {}", e))?;
+        let join_handle = thread::spawn(move || {
+            while !stop_c.load(Ordering::Relaxed) {
+                let loop_start = Instant::now();
+                match SCScreenshotManager::capture_sample_buffer(&filter, &config) {
+                    Ok(sample) => {
+                        handler(sample, SCStreamOutputType::Screen);
+                    }
+                    Err(e) => {
+                        eprintln!("  Screenshot capture error: {}", e);
+                    }
+                }
+                let elapsed = loop_start.elapsed();
+                if elapsed < interval {
+                    thread::sleep(interval - elapsed);
+                }
+            }
+        });
 
         Ok(CaptureSession {
-            stream: Some(stream),
+            stop,
+            join_handle: Some(join_handle),
         })
     }
 
     pub fn stop(&mut self) {
-        if let Some(stream) = self.stream.take() {
-            let _ = stream.stop_capture();
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.join_handle.take() {
+            let _ = h.join();
         }
     }
 }

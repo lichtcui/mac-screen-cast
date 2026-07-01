@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 
-use videotoolbox::compression::{CompressionSession, EncodedFrame};
+use videotoolbox::compression::{CompressionSession, EncodedFrame, ProfileLevel};
 use videotoolbox::session::Codec;
 
 #[derive(Clone)]
@@ -36,6 +36,7 @@ impl VtEncoder {
         let bitrate = ((width as f64 * height as f64 * fps as f64 * 0.07) as u32)
             .clamp(500_000, 10_000_000);
         let session = CompressionSession::builder(width as i32, height as i32, Codec::H264)
+            .with_profile_level(ProfileLevel::H264ConstrainedBaselineAutoLevel)
             .with_real_time(true)
             .with_allow_frame_reordering(false)
             .with_expected_frame_rate(fps as f64)
