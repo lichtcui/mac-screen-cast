@@ -22,6 +22,7 @@ videotoolbox = "0.18"
 apple-cf = { version = "0.9", default-features = false, features = ["iosurface"] }
 qrcode = "0.14"
 ureq = "2"
+spin_sleep = "1"
 
 [profile.release]
 opt-level = 3

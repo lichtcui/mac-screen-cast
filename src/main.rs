@@ -209,6 +209,14 @@ fn main() {
     // ── Channel: encoded frames (+ capture timestamp) → WebRTC sender ──
     let (frame_tx, frame_rx) = mpsc::sync_channel::<(h264::H264Frame, Instant)>(60);
 
+    // ── Channel: raw frames (capture → encoder thread, small buffer for low latency) ──
+    struct RawFrame {
+        sample: CMSampleBuffer,
+        seq: u64,
+        cap_time: Instant,
+    }
+    let (raw_tx, raw_rx) = mpsc::sync_channel::<RawFrame>(4);
+
     // ── Stop flag ──
     let stop = Arc::new(AtomicBool::new(false));
     let ctrlc_count = Arc::new(AtomicBool::new(false));
@@ -226,6 +234,38 @@ fn main() {
         .ok();
     }
 
+    // ── Encoder thread: decoupled from capture for pipeline parallelism ──
+    // Capture thread now only takes screenshots and pushes to raw_tx;
+    // encoding runs here in parallel so capture of frame N+1 overlaps
+    // with encoding of frame N.
+    let encoder_thread = {
+        let encoder = encoder.clone();
+        let frame_tx = frame_tx.clone();
+        let stop_c = stop.clone();
+        thread::spawn(move || {
+            while !stop_c.load(Ordering::Relaxed) {
+                match raw_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(raw) => {
+                        if let Some(pb) = raw.sample.image_buffer() {
+                            if let Some(surface) = pb.io_surface() {
+                                match encoder.encode(&surface, raw.seq, fps as i32) {
+                                    Ok(frame) => {
+                                        let _ = frame_tx.send((frame, raw.cap_time));
+                                    }
+                                    Err(e) => {
+                                        eprintln!("\n  Encode error: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })
+    };
+
     // ── Latency measurement ──
     let latest_latency = Arc::new(AtomicU64::new(0));
 
@@ -234,8 +274,10 @@ fn main() {
         tokio::runtime::Runtime::new().expect("create Tokio runtime for WebRTC"),
     );
     let wr_handle: Arc<Mutex<Option<webrtc::WebRtcHandle>>> = Arc::new(Mutex::new(None));
+    let wr_version = Arc::new(AtomicU64::new(0));
     let srv_wr_conn = Arc::new(AtomicBool::new(false));
     let srv_wr = wr_handle.clone();
+    let srv_wr_ver = wr_version.clone();
     let srv_rt = webrtc_rt.clone();
     let svr_s = stop.clone();
     let srv_lat = latest_latency.clone();
@@ -311,9 +353,10 @@ fn main() {
                             webrtc::WebRtcHandle::new(srv_rt.handle().clone(), fps, out_w, out_h)
                         {
                             *lock_mutex(&srv_wr) = Some(new_handle);
-                            eprintln!("  WebRTC offer recreated for refresh");
+                            srv_wr_ver.fetch_add(1, Ordering::Release);
+                            eprintln!("\n  WebRTC offer recreated for refresh");
                         } else {
-                            eprintln!("  WebRTC recreate failed");
+                            eprintln!("\n  WebRTC recreate failed");
                         }
                     }
                     match lock_mutex(&srv_wr).as_ref() {
@@ -343,7 +386,7 @@ fn main() {
                                             }
                                         }
                                         srv_wr_conn.store(true, Ordering::Relaxed);
-                                        eprintln!("  Signal exchange complete");
+                                        eprintln!("\n  Signal exchange complete");
                                         ok = true;
                                     }
                                 }
@@ -362,6 +405,7 @@ fn main() {
                 "/latency" => {
                     let ms = srv_lat.load(Ordering::Relaxed);
                     Response::from_data(format!("{}", ms).into_bytes())
+                        .with_header("Content-Type: text/plain".parse::<Header>().unwrap())
                 }
                 _ => Response::from_data(Vec::from("{\"error\":\"not found\"}"))
                     .with_status_code(404)
@@ -377,14 +421,15 @@ fn main() {
             Ok(handle) => {
                 eprintln!("  WebRTC offer ready");
                 *lock_mutex(&wr_handle) = Some(handle);
+                wr_version.fetch_add(1, Ordering::Release);
             }
             Err(e) => eprintln!("  WebRTC init failed: {}", e),
         }
     }
 
     // ── Start ScreenCaptureKit capture ──
-    let encoder_cb = encoder.clone();
-    let frame_tx_cb = frame_tx.clone();
+    let raw_tx_cb = raw_tx.clone();
+    let stop_for_cap = stop.clone();
     let frame_count = Arc::new(AtomicU64::new(0));
     let frame_count_cb = frame_count.clone();
 
@@ -394,26 +439,10 @@ fn main() {
         out_h,
         fps,
         move |sample: CMSampleBuffer, _type: SCStreamOutputType| {
-            let n = frame_count_cb.fetch_add(1, Ordering::Relaxed);
-            if n < 10 || n.is_multiple_of(150) {
-                eprint!("\r  SCFrame #{}", n);
-                std::io::stderr().flush().ok();
-            }
-            if let Some(pb) = sample.image_buffer() {
-                if let Some(surface) = pb.io_surface() {
-                    let cap_time = Instant::now();
-                    match encoder_cb.encode(&surface, n, fps as i32) {
-                        Ok(frame) => {
-                            let _ = frame_tx_cb.send((frame, cap_time));
-                        }
-                        Err(e) => {
-                            eprintln!("\n  Encode error: {}", e);
-                        }
-                    }
-                } else {
-                    eprint!("\r  No IOSurface for frame #{}", n);
-                    std::io::stderr().flush().ok();
-                }
+            let seq = frame_count_cb.fetch_add(1, Ordering::Relaxed);
+            if raw_tx_cb.send(RawFrame { sample, seq, cap_time: Instant::now() }).is_err() {
+                eprintln!("\n  Encoder thread disconnected — stopping capture");
+                stop_for_cap.store(true, Ordering::Relaxed);
             }
         },
     ) {
@@ -425,45 +454,71 @@ fn main() {
     };
 
     // ── Main loop: receive encoded frames → WebRTC ──
-    let mut h264_frame_count: u64 = 0;
-    let mut last_report = Instant::now();
-    let mut last_frame = Instant::now();
+    let mut send_count: u64 = 0;
+    let mut last_stats = Instant::now();
+    let mut last_send = Instant::now();
+    let mut prev_cap: u64 = 0;
+    let mut prev_send: u64 = 0;
+
+    // Cache the WebRTC handle to avoid locking every frame.
+    // Re-clone when HTTP thread refreshes (page reload).
+    let mut wr_cached: Option<webrtc::WebRtcHandle> = lock_mutex(&wr_handle).clone();
+    let mut wr_ver = wr_version.load(Ordering::Acquire);
 
     while !stop.load(Ordering::Relaxed) {
         match frame_rx.recv_timeout(Duration::from_millis(100)) {
             Ok((frame, cap_time)) => {
-                h264_frame_count += 1;
-                last_frame = Instant::now();
+                // Re-read handle if HTTP thread replaced it on refresh
+                let v = wr_version.load(Ordering::Acquire);
+                if v != wr_ver {
+                    wr_cached = lock_mutex(&wr_handle).clone();
+                    wr_ver = v;
+                }
 
-                if let Some(ref wr) = *lock_mutex(&wr_handle) {
+                send_count += 1;
+                last_send = Instant::now();
+
+                if let Some(ref wr) = wr_cached {
                     if let Err(e) = wr.send_frame(&frame) {
-                        eprintln!("  WebRTC send error: {}", e);
+                        eprintln!("\n  WebRTC send error: {}", e);
                     }
                 }
 
                 latest_latency.store(cap_time.elapsed().as_millis() as u64, Ordering::Relaxed);
 
-                if h264_frame_count.is_multiple_of(150) && last_report.elapsed() >= Duration::from_secs(3) {
-                    print!("\r  {} frames", h264_frame_count);
-                    std::io::stdout().flush().ok();
-                    last_report = Instant::now();
+                // Per-second stats
+                let elapsed = last_stats.elapsed();
+                if elapsed >= Duration::from_secs(1) {
+                    let cap_total = frame_count.load(Ordering::Relaxed);
+                    let cap_fps = (cap_total - prev_cap) as f64 / elapsed.as_secs_f64();
+                    let snd_fps = (send_count - prev_send) as f64 / elapsed.as_secs_f64();
+                    let lat = latest_latency.load(Ordering::Relaxed);
+                    eprint!(
+                        "\r  cap: {:.0}fps  send: {:.0}fps  lat: {}ms  [total: {}]  ",
+                        cap_fps, snd_fps, lat, send_count,
+                    );
+                    std::io::stderr().flush().ok();
+                    prev_cap = cap_total;
+                    prev_send = send_count;
+                    last_stats = Instant::now();
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if last_frame.elapsed() > Duration::from_secs(3) && h264_frame_count > 0 {
+                if last_send.elapsed() > Duration::from_secs(3) && send_count > 0 {
                     eprintln!("\n  No frames for 3s — encoder may have failed");
-                    last_frame = Instant::now();
+                    last_send = Instant::now();
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!("  Encoder channel disconnected");
+                eprintln!("\n  Encoder channel disconnected");
                 stop.store(true, Ordering::Relaxed);
                 break;
             }
         }
     }
 
-    // Cleanup
+    // Cleanup (order: capture → encoder → server)
     capture_session.stop();
+    encoder_thread.join().ok();
     srv.join().ok();
 }

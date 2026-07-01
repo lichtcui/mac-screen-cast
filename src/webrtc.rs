@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -16,14 +16,36 @@ use crate::h264::H264Frame;
 const RTP_CLOCK_RATE: u32 = 90000;
 const RTP_MTU: usize = 1200;
 
+/// RTP packets for one frame — sent from caller thread to WebRTC Tokio task.
+struct RtpBatch {
+    ts: u32,
+    packets: Vec<(Vec<u8>, bool)>,
+}
+
 pub struct WebRtcHandle {
     pub offer: String,
     pc: PeerConnection,
-    sample_source: rustrtc::media::track::SampleStreamSource,
-    rtp_timestamp: AtomicU32,
+    rtp_timestamp: Arc<AtomicU32>,
     rtp_ts_per_frame: u32,
     rt: Handle,
     stop_notify: Arc<tokio::sync::Notify>,
+    rtp_tx: tokio::sync::mpsc::Sender<RtpBatch>,
+    rtp_buf: Mutex<Vec<(Vec<u8>, bool)>>,
+}
+
+impl Clone for WebRtcHandle {
+    fn clone(&self) -> Self {
+        WebRtcHandle {
+            offer: self.offer.clone(),
+            pc: self.pc.clone(),
+            rtp_timestamp: self.rtp_timestamp.clone(),
+            rtp_ts_per_frame: self.rtp_ts_per_frame,
+            rt: self.rt.clone(),
+            stop_notify: self.stop_notify.clone(),
+            rtp_tx: self.rtp_tx.clone(),
+            rtp_buf: Mutex::new(Vec::with_capacity(32)),
+        }
+    }
 }
 
 impl WebRtcHandle {
@@ -61,7 +83,13 @@ impl WebRtcHandle {
 
                 let pc = PeerConnection::new(config);
 
-                let (source, track, _feedback_rx) = sample_track(MediaKind::Video, 120);
+                let (source, track, feedback_rx) = sample_track(MediaKind::Video, 120);
+
+                // Drain the feedback channel to prevent backpressure on the sender side.
+                tokio::spawn(async move {
+                    let mut rx = feedback_rx;
+                    while rx.recv().await.is_some() {}
+                });
 
                 pc.add_track(
                     track,
@@ -96,14 +124,38 @@ impl WebRtcHandle {
             }
         })?;
 
+        // Channel for RTP batches: caller thread → Tokio WebRTC send task.
+        // Capacity 8 keeps latency bounded while smoothing brief send bursts.
+        let (rtp_tx, mut rtp_rx) = tokio::sync::mpsc::channel::<RtpBatch>(8);
+
+        let source_for_task = sample_source.clone();
+        rt.spawn(async move {
+            while let Some(batch) = rtp_rx.recv().await {
+                for (payload, is_last) in batch.packets {
+                    if let Err(e) = source_for_task
+                        .send_video(VideoFrame {
+                            rtp_timestamp: batch.ts,
+                            data: Bytes::from(payload),
+                            is_last_packet: is_last,
+                            ..Default::default()
+                        })
+                        .await
+                    {
+                        eprintln!("  WebRTC send error: {}", e);
+                    }
+                }
+            }
+        });
+
         Ok(WebRtcHandle {
             offer: offer_sdp,
             pc,
-            sample_source,
-            rtp_timestamp: AtomicU32::new(0),
+            rtp_timestamp: Arc::new(AtomicU32::new(0)),
             rtp_ts_per_frame: RTP_CLOCK_RATE / fps.max(1),
             rt,
             stop_notify,
+            rtp_tx,
+            rtp_buf: Mutex::new(Vec::with_capacity(32)),
         })
     }
 
@@ -137,7 +189,11 @@ impl WebRtcHandle {
     }
 
     pub fn send_frame(&self, frame: &H264Frame) -> Result<(), String> {
-        let mut rtp_packets: Vec<(Vec<u8>, bool)> = Vec::with_capacity(32);
+        let mut rtp_packets = self
+            .rtp_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        rtp_packets.clear();
 
         if frame.is_keyframe {
             if let Some(ref sps) = frame.sps {
@@ -149,8 +205,6 @@ impl WebRtcHandle {
         }
 
         for (nal, is_last) in crate::h264::avcc_nal_units(&frame.data) {
-            // Skip SPS (type 7) and PPS (type 8) on keyframes —
-            // already prepended from the format description above.
             if frame.is_keyframe {
                 match nal.first().map(|b| b & 0x1f) {
                     Some(7) | Some(8) => continue,
@@ -164,21 +218,17 @@ impl WebRtcHandle {
             .rtp_timestamp
             .fetch_add(self.rtp_ts_per_frame, Ordering::Relaxed);
 
-        let source = self.sample_source.clone();
-        self.rt.block_on(async move {
-            for (payload, is_last) in rtp_packets {
-                source
-                    .send_video(VideoFrame {
-                        rtp_timestamp: ts,
-                        data: Bytes::from(payload),
-                        is_last_packet: is_last,
-                        ..Default::default()
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(())
-        })
+        // Move the packets out of the reused buffer into the channel.
+        // The Tokio task takes ownership; next frame gets a fresh clear.
+        let batch = RtpBatch {
+            ts,
+            packets: std::mem::take(&mut *rtp_packets),
+        };
+        drop(rtp_packets);
+
+        self.rtp_tx
+            .blocking_send(batch)
+            .map_err(|e| format!("RTP channel closed: {}", e))
     }
 }
 

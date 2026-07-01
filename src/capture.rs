@@ -56,7 +56,7 @@ impl CaptureSession {
                 next_frame += interval;
                 let now = Instant::now();
                 if next_frame > now {
-                    thread::sleep(next_frame - now);
+                    spin_sleep::sleep(next_frame - now);
                 } else {
                     next_frame = now;
                 }
