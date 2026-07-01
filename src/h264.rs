@@ -1,5 +1,4 @@
 use std::ffi::c_void;
-use std::sync::Mutex;
 
 use videotoolbox::compression::{CompressionSession, EncodedFrame};
 use videotoolbox::session::Codec;
@@ -12,18 +11,11 @@ pub struct H264Frame {
     pub pps: Option<Vec<u8>>,
 }
 
-struct SpsPpsCache {
-    sps: Option<Vec<u8>>,
-    pps: Option<Vec<u8>>,
-}
-
 pub struct VtEncoder {
     session: CompressionSession,
-    cache: Mutex<SpsPpsCache>,
 }
 
-// VideoToolbox CompressionSession handles are thread-safe;
-// the cache Mutex provides interior mutability for SPS/PPS.
+// VideoToolbox CompressionSession handles are thread-safe.
 unsafe impl Send for VtEncoder {}
 unsafe impl Sync for VtEncoder {}
 
@@ -40,18 +32,18 @@ extern "C" {
 
 impl VtEncoder {
     pub fn new(width: u32, height: u32, fps: u32) -> Result<Self, String> {
+        // Heuristic: 0.07 bits per pixel per frame, clamped to [500 Kbps, 10 Mbps]
+        let bitrate = ((width as f64 * height as f64 * fps as f64 * 0.07) as u32)
+            .clamp(500_000, 10_000_000);
         let session = CompressionSession::builder(width as i32, height as i32, Codec::H264)
             .with_real_time(true)
             .with_allow_frame_reordering(false)
             .with_expected_frame_rate(fps as f64)
             .with_max_keyframe_interval((fps * 2) as i32)
-            .with_average_bit_rate(4_000_000)
+            .with_average_bit_rate(bitrate as i32)
             .build()
             .map_err(|e| format!("CompressionSession init failed: {}", e))?;
-        Ok(VtEncoder {
-            session,
-            cache: Mutex::new(SpsPpsCache { sps: None, pps: None }),
-        })
+        Ok(VtEncoder { session })
     }
 
     pub fn encode(
@@ -65,19 +57,10 @@ impl VtEncoder {
             .encode(surface, (frame_num as i64, fps))
             .map_err(|e| format!("VT encode failed: {}", e))?;
 
-        let is_keyframe = scan_for_idr(&encoded.data);
-
-        if is_keyframe {
-            let (sps, pps) = extract_sps_pps(&encoded);
-            if let Ok(mut cache) = self.cache.lock() {
-                cache.sps = sps;
-                cache.pps = pps;
-            }
-        }
+        let is_keyframe = (encoded.info_flags & 1) != 0;
 
         let (sps, pps) = if is_keyframe {
-            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            (cache.sps.clone(), cache.pps.clone())
+            extract_sps_pps(&encoded)
         } else {
             (None, None)
         };
@@ -154,6 +137,7 @@ fn extract_sps_pps(encoded: &EncodedFrame) -> (Option<Vec<u8>>, Option<Vec<u8>>)
     }
 }
 
+#[cfg(test)]
 fn scan_for_idr(data: &[u8]) -> bool {
     let mut pos = 0;
     while pos + 5 <= data.len() {

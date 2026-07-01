@@ -53,11 +53,12 @@ fn list_windows() {
 
 #[test]
 #[ignore = "requires Screen Recording permission"]
-fn stream_default_port() {
+fn list_windows_spawn_and_kill() {
     let mut child = Command::new(binary_path())
         .arg("--list")
         .spawn()
         .expect("failed to start binary");
     std::thread::sleep(std::time::Duration::from_secs(2));
     child.kill().ok();
+    let _ = child.wait();
 }

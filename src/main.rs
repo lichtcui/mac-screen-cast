@@ -36,18 +36,34 @@ fn main() {
         match args[i].as_str() {
             "-w" | "--window-id" => {
                 i += 1;
+                if i >= args.len() {
+                    eprintln!("Missing value for --window-id");
+                    break;
+                }
                 wid = args[i].parse().unwrap_or(0);
             }
             "--width" => {
                 i += 1;
+                if i >= args.len() {
+                    eprintln!("Missing value for --width");
+                    break;
+                }
                 max_w = args[i].parse().unwrap_or(1280);
             }
             "--fps" => {
                 i += 1;
+                if i >= args.len() {
+                    eprintln!("Missing value for --fps");
+                    break;
+                }
                 fps = args[i].parse().unwrap_or(30).clamp(1, 60);
             }
             "--port" => {
                 i += 1;
+                if i >= args.len() {
+                    eprintln!("Missing value for --port");
+                    break;
+                }
                 port = args[i].parse().unwrap_or(8080);
             }
             "--json" => json_output = true,
@@ -214,10 +230,9 @@ fn main() {
         tokio::runtime::Runtime::new().expect("create Tokio runtime for WebRTC"),
     );
     let wr_handle: Arc<Mutex<Option<webrtc::WebRtcHandle>>> = Arc::new(Mutex::new(None));
-    let webrtc_connected = Arc::new(AtomicBool::new(false));
+    let srv_wr_conn = Arc::new(AtomicBool::new(false));
     let srv_wr = wr_handle.clone();
     let srv_rt = webrtc_rt.clone();
-    let srv_wr_conn = webrtc_connected.clone();
     let svr_s = stop.clone();
     let srv_lat = latest_latency.clone();
     let ip = server::get_ip();
@@ -289,7 +304,7 @@ fn main() {
                         }
                         // Create replacement PeerConnection on the same runtime
                         if let Ok(new_handle) =
-                            webrtc::WebRtcHandle::new(srv_rt.handle().clone(), fps, svr_s.clone())
+                            webrtc::WebRtcHandle::new(srv_rt.handle().clone(), fps, out_w, out_h, svr_s.clone())
                         {
                             *lock_mutex(&srv_wr) = Some(new_handle);
                             eprintln!("  WebRTC offer recreated for refresh");
@@ -308,35 +323,36 @@ fn main() {
                     }
                 }
                 "/signal" => {
+                    let mut ok = false;
                     let mut body = String::new();
                     if req.as_reader().read_to_string(&mut body).is_ok() {
                         if let Some(ref wr) = *lock_mutex(&srv_wr) {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                                 if let Some(sdp) = v["sdp"].as_str() {
-                                    let _ = wr.set_answer(sdp.to_string());
-                                    if let Some(cands) = v["candidates"].as_array() {
-                                        for c in cands {
-                                            let cs = c["candidate"].as_str().unwrap_or("");
-                                            if !cs.is_empty() {
-                                                let sdp_mid =
-                                                    c["sdpMid"].as_str().map(|s| s.to_string());
-                                                let sdp_mline_index =
-                                                    c["sdpMLineIndex"].as_u64().map(|n| n as u16);
-                                                let _ = wr.add_candidate(
-                                                    cs,
-                                                    sdp_mid,
-                                                    sdp_mline_index,
-                                                );
+                                    if wr.set_answer(sdp.to_string()).is_ok() {
+                                        if let Some(cands) = v["candidates"].as_array() {
+                                            for c in cands {
+                                                let cs = c["candidate"].as_str().unwrap_or("");
+                                                if !cs.is_empty() {
+                                                    let _ = wr.add_candidate(cs);
+                                                }
                                             }
                                         }
+                                        srv_wr_conn.store(true, Ordering::Relaxed);
+                                        eprintln!("  Signal exchange complete");
+                                        ok = true;
                                     }
-                                    srv_wr_conn.store(true, Ordering::Relaxed);
-                                    eprintln!("  Signal exchange complete");
                                 }
                             }
                         }
                     }
-                    Response::from_data(Vec::from("{\"status\":\"ok\"}"))
+                    let (status, body) = if ok {
+                        (200, "{\"status\":\"ok\"}")
+                    } else {
+                        (500, "{\"error\":\"signal failed\"}")
+                    };
+                    Response::from_data(Vec::from(body))
+                        .with_status_code(status)
                         .with_header("Content-Type: application/json".parse::<Header>().unwrap())
                 }
                 "/latency" => {
@@ -353,7 +369,7 @@ fn main() {
 
     // ── Init WebRTC (blocks ~3s for ICE gathering) ──
     {
-        match webrtc::WebRtcHandle::new(webrtc_rt.handle().clone(), fps, stop.clone()) {
+        match webrtc::WebRtcHandle::new(webrtc_rt.handle().clone(), fps, out_w, out_h, stop.clone()) {
             Ok(handle) => {
                 eprintln!("  WebRTC offer ready");
                 *lock_mutex(&wr_handle) = Some(handle);
@@ -375,7 +391,7 @@ fn main() {
         fps,
         move |sample: CMSampleBuffer, _type: SCStreamOutputType| {
             let n = frame_count_cb.fetch_add(1, Ordering::Relaxed);
-            if n < 10 || n % 150 == 0 {
+            if n < 10 || n.is_multiple_of(150) {
                 eprint!("\r  SCFrame #{}", n);
                 std::io::stderr().flush().ok();
             }
@@ -423,7 +439,7 @@ fn main() {
 
                 latest_latency.store(cap_time.elapsed().as_millis() as u64, Ordering::Relaxed);
 
-                if h264_frame_count % 150 == 0 && last_report.elapsed() >= Duration::from_secs(3) {
+                if h264_frame_count.is_multiple_of(150) && last_report.elapsed() >= Duration::from_secs(3) {
                     print!("\r  {} frames", h264_frame_count);
                     std::io::stdout().flush().ok();
                     last_report = Instant::now();
@@ -437,6 +453,7 @@ fn main() {
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 eprintln!("  Encoder channel disconnected");
+                stop.store(true, Ordering::Relaxed);
                 break;
             }
         }

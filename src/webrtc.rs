@@ -26,16 +26,27 @@ pub struct WebRtcHandle {
 }
 
 impl WebRtcHandle {
-    pub fn new(rt: Handle, fps: u32, stop: Arc<AtomicBool>) -> Result<Self, String> {
+    pub fn new(rt: Handle, fps: u32, width: u32, height: u32, stop: Arc<AtomicBool>) -> Result<Self, String> {
+        let level = |pixels: u32| -> &str {
+            match pixels {
+                p if p <= 1280 * 720 => "1f", // Level 3.1
+                p if p <= 1920 * 1080 => "29", // Level 4.1
+                _ => "32",                     // Level 5.0
+            }
+        };
+        let profile_level_id = format!("42e0{}", level(width * height));
+
         let (pc, sample_source, offer_sdp) = rt.block_on(async {
             let mut h264 = rustrtc::config::VideoCapability::h264();
-            h264.fmtp = Some(
-                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                    .to_string(),
-            );
+            h264.fmtp = Some(format!(
+                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={}",
+                profile_level_id,
+            ));
 
-            let mut caps = MediaCapabilities::default();
-            caps.video = vec![h264];
+            let caps = MediaCapabilities {
+                video: vec![h264],
+                ..Default::default()
+            };
 
             let config = RtcConfiguration {
                 ice_servers: vec![],
@@ -76,7 +87,7 @@ impl WebRtcHandle {
                 while !stop_c.load(Ordering::Relaxed) {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                let _ = pc_c.close();
+                pc_c.close();
             });
 
             Ok::<_, String>((pc, source, offer_sdp))
@@ -103,12 +114,7 @@ impl WebRtcHandle {
         })
     }
 
-    pub fn add_candidate(
-        &self,
-        candidate: &str,
-        _sdp_mid: Option<String>,
-        _sdp_mline_index: Option<u16>,
-    ) -> Result<(), String> {
+    pub fn add_candidate(&self, candidate: &str) -> Result<(), String> {
         let ice_candidate =
             IceCandidate::from_sdp(candidate).map_err(|e| format!("ICE parse error: {}", e))?;
         self.pc
@@ -126,27 +132,32 @@ impl WebRtcHandle {
     }
 
     pub fn send_frame(&self, frame: &H264Frame) -> Result<(), String> {
-        let mut nal_units: Vec<(Vec<u8>, bool)> = Vec::new();
+        let mut rtp_packets: Vec<(Vec<u8>, bool)> = Vec::with_capacity(32);
 
         if frame.is_keyframe {
             if let Some(ref sps) = frame.sps {
-                nal_units.push((sps.clone(), false));
+                rtp_packets.extend(packetize_nal(sps.clone(), false, RTP_MTU));
             }
             if let Some(ref pps) = frame.pps {
-                nal_units.push((pps.clone(), false));
+                rtp_packets.extend(packetize_nal(pps.clone(), false, RTP_MTU));
             }
         }
 
-        nal_units.extend(crate::h264::avcc_nal_units(&frame.data));
+        for (nal, is_last) in crate::h264::avcc_nal_units(&frame.data) {
+            // Skip SPS (type 7) and PPS (type 8) on keyframes —
+            // already prepended from the format description above.
+            if frame.is_keyframe {
+                match nal.first().map(|b| b & 0x1f) {
+                    Some(7) | Some(8) => continue,
+                    _ => {}
+                }
+            }
+            rtp_packets.extend(packetize_nal(nal, is_last, RTP_MTU));
+        }
 
         let ts = self
             .rtp_timestamp
             .fetch_add(self.rtp_ts_per_frame, Ordering::Relaxed);
-
-        let mut rtp_packets: Vec<(Vec<u8>, bool)> = Vec::new();
-        for (nal_data, is_last_nal) in nal_units {
-            rtp_packets.extend(packetize_nal(nal_data, is_last_nal, RTP_MTU));
-        }
 
         let source = self.sample_source.clone();
         self.rt.block_on(async move {
@@ -185,21 +196,22 @@ pub(crate) fn packetize_nal(
     let fu_indicator = 0x1c | (nal_header & 0x60);
     let nal_type = nal_header & 0x1f;
     let max_chunk = mtu - 2;
-    let mut packets = Vec::new();
+    let num_fragments = (data.len() - 1).div_ceil(max_chunk);
+    let mut packets = Vec::with_capacity(num_fragments);
     let mut offset = 1;
     while offset < data.len() {
         let chunk_end = (offset + max_chunk).min(data.len());
         let chunk = &data[offset..chunk_end];
         let is_first = offset == 1;
-        let is_last = chunk_end >= data.len();
+        let is_last_fragment = chunk_end >= data.len();
         let fu_header = (if is_first { 0x80 } else { 0 })
-            | (if is_last { 0x40 } else { 0 })
+            | (if is_last_fragment { 0x40 } else { 0 })
             | nal_type;
         let mut payload = Vec::with_capacity(2 + chunk.len());
         payload.push(fu_indicator);
         payload.push(fu_header);
         payload.extend_from_slice(chunk);
-        packets.push((payload, is_last && is_last_nal));
+        packets.push((payload, is_last_fragment && is_last_nal));
         offset = chunk_end;
     }
     packets
@@ -226,7 +238,7 @@ mod tests {
     #[test]
     fn packetize_exact_mtu() {
         let mut nal = vec![0x41];
-        nal.extend(std::iter::repeat(0xFF).take(1199));
+        nal.extend(std::iter::repeat_n(0xFF, 1199));
         let packets = packetize_nal(nal, true, 1200);
         assert_eq!(packets.len(), 1);
     }
@@ -243,7 +255,7 @@ mod tests {
     fn packetize_fua_basic() {
         let nal_type = 0x65;
         let mut nal = vec![nal_type];
-        nal.extend(std::iter::repeat(0xFF).take(2400));
+        nal.extend(std::iter::repeat_n(0xFF, 2400));
         let packets = packetize_nal(nal, true, 1200);
         assert!(packets.len() >= 2, "should be fragmented into {} packets", packets.len());
         // All packets ≤ MTU
@@ -261,7 +273,7 @@ mod tests {
     #[test]
     fn packetize_fua_nal_type_preserved() {
         let mut nal = vec![0x21]; // NRI=1, type=1
-        nal.extend(std::iter::repeat(0xFF).take(2000));
+        nal.extend(std::iter::repeat_n(0xFF, 2000));
         let packets = packetize_nal(nal, true, 1200);
         for p in &packets {
             assert_eq!(p.0[1] & 0x1f, 1, "NAL type should be 1");
@@ -271,7 +283,7 @@ mod tests {
     #[test]
     fn packetize_fua_is_last_nal_false() {
         let mut nal = vec![0x65];
-        nal.extend(std::iter::repeat(0xFF).take(2400));
+        nal.extend(std::iter::repeat_n(0xFF, 2400));
         let packets = packetize_nal(nal, false, 1200);
         assert!(!packets.last().unwrap().1);
     }
@@ -280,7 +292,7 @@ mod tests {
     fn packetize_fua_three_fragments() {
         // 2401 byte NAL → 3 FU-A fragments (max_chunk=1198)
         let mut nal = vec![0x41];
-        nal.extend(std::iter::repeat(0xAA).take(2400));
+        nal.extend(std::iter::repeat_n(0xAA, 2400));
         let packets = packetize_nal(nal, true, 1200);
         assert_eq!(packets.len(), 3);
         assert_ne!(packets[0].0[1] & 0x80, 0); // start

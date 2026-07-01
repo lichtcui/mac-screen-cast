@@ -17,8 +17,6 @@ pub fn check() {
                 }
             }
         }
-        let _ = std::fs::write(&cache, "");
-
         let url = format!("https://api.github.com/repos/{}/releases/latest", REPO);
         let resp = ureq::get(&url)
             .set("User-Agent", "mac-screen-cast")
@@ -34,6 +32,8 @@ pub fn check() {
             Some(t) => t,
             None => return,
         };
+
+        let _ = std::fs::write(&cache, tag);
 
         match (parse_version(tag), parse_version(CURRENT_VERSION)) {
             (Some(latest), Some(current)) if latest > current => {
