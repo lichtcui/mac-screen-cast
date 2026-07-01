@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use screencapturekit::cm::CMSampleBuffer;
 use screencapturekit::prelude::*;
+use screencapturekit::stream::content_filter::SCContentFilter;
 
 fn lock_mutex<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -157,8 +158,8 @@ fn main() {
     // must be called once before any SCStream usage in command-line tools.
     unsafe { screencapturekit::ffi::sc_initialize_core_graphics() }
 
-    // ── Compute output dimensions via SCShareableContent ──
-    let (out_w, out_h) = {
+    // ── Compute output dimensions + build capture filter via SCShareableContent ──
+    let (out_w, out_h, capture_filter) = {
         let content = SCShareableContent::get().unwrap_or_else(|e| {
             eprintln!("ScreenCaptureKit error: {e}");
             eprintln!(
@@ -185,7 +186,10 @@ fn main() {
         } else {
             (nw, nh)
         };
-        (ow & !1, oh & !1)
+
+        let filter = SCContentFilter::create().with_window(window).build();
+
+        (ow & !1, oh & !1, filter)
     };
 
     eprintln!(
@@ -304,7 +308,7 @@ fn main() {
                         }
                         // Create replacement PeerConnection on the same runtime
                         if let Ok(new_handle) =
-                            webrtc::WebRtcHandle::new(srv_rt.handle().clone(), fps, out_w, out_h, svr_s.clone())
+                            webrtc::WebRtcHandle::new(srv_rt.handle().clone(), fps, out_w, out_h)
                         {
                             *lock_mutex(&srv_wr) = Some(new_handle);
                             eprintln!("  WebRTC offer recreated for refresh");
@@ -369,7 +373,7 @@ fn main() {
 
     // ── Init WebRTC (blocks ~3s for ICE gathering) ──
     {
-        match webrtc::WebRtcHandle::new(webrtc_rt.handle().clone(), fps, out_w, out_h, stop.clone()) {
+        match webrtc::WebRtcHandle::new(webrtc_rt.handle().clone(), fps, out_w, out_h) {
             Ok(handle) => {
                 eprintln!("  WebRTC offer ready");
                 *lock_mutex(&wr_handle) = Some(handle);
@@ -385,7 +389,7 @@ fn main() {
     let frame_count_cb = frame_count.clone();
 
     let mut capture_session = match capture::CaptureSession::new(
-        wid,
+        capture_filter,
         out_w,
         out_h,
         fps,

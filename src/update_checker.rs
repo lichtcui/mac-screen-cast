@@ -63,3 +63,54 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_version_v_prefix() {
+        assert_eq!(parse_version("v0.2.4"), Some((0, 2, 4)));
+    }
+
+    #[test]
+    fn parse_version_no_prefix() {
+        assert_eq!(parse_version("1.15.0"), Some((1, 15, 0)));
+    }
+
+    #[test]
+    fn parse_version_only_two_parts() {
+        assert_eq!(parse_version("1.0"), None);
+    }
+
+    #[test]
+    fn parse_version_empty() {
+        assert_eq!(parse_version(""), None);
+    }
+
+    #[test]
+    fn parse_version_non_numeric() {
+        assert_eq!(parse_version("v0.2.4-beta"), None);
+    }
+
+    #[test]
+    fn parse_version_four_parts() {
+        // splitn(3, '.') only splits into 3 parts, the last contains the rest
+        assert_eq!(parse_version("1.2.3.4"), None);
+    }
+
+    #[test]
+    fn parse_version_just_v() {
+        assert_eq!(parse_version("v"), None);
+    }
+
+    #[test]
+    fn parse_version_leading_zero() {
+        assert_eq!(parse_version("0.0.0"), Some((0, 0, 0)));
+    }
+
+    #[test]
+    fn parse_version_large_numbers() {
+        assert_eq!(parse_version("999.888.777"), Some((999, 888, 777)));
+    }
+}

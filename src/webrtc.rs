@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,10 +23,11 @@ pub struct WebRtcHandle {
     rtp_timestamp: AtomicU32,
     rtp_ts_per_frame: u32,
     rt: Handle,
+    stop_notify: Arc<tokio::sync::Notify>,
 }
 
 impl WebRtcHandle {
-    pub fn new(rt: Handle, fps: u32, width: u32, height: u32, stop: Arc<AtomicBool>) -> Result<Self, String> {
+    pub fn new(rt: Handle, fps: u32, width: u32, height: u32) -> Result<Self, String> {
         let level = |pixels: u32| -> &str {
             match pixels {
                 p if p <= 1280 * 720 => "1f", // Level 3.1
@@ -36,61 +37,63 @@ impl WebRtcHandle {
         };
         let profile_level_id = format!("42e0{}", level(width * height));
 
-        let (pc, sample_source, offer_sdp) = rt.block_on(async {
-            let mut h264 = rustrtc::config::VideoCapability::h264();
-            h264.fmtp = Some(format!(
-                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={}",
-                profile_level_id,
-            ));
+        let stop_notify = Arc::new(tokio::sync::Notify::new());
 
-            let caps = MediaCapabilities {
-                video: vec![h264],
-                ..Default::default()
-            };
+        let (pc, sample_source, offer_sdp) = rt.block_on({
+            let notify_c = stop_notify.clone();
+            async move {
+                let mut h264 = rustrtc::config::VideoCapability::h264();
+                h264.fmtp = Some(format!(
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={}",
+                    profile_level_id,
+                ));
 
-            let config = RtcConfiguration {
-                ice_servers: vec![],
-                media_capabilities: Some(caps),
-                ..Default::default()
-            };
+                let caps = MediaCapabilities {
+                    video: vec![h264],
+                    ..Default::default()
+                };
 
-            let pc = PeerConnection::new(config);
+                let config = RtcConfiguration {
+                    ice_servers: vec![],
+                    media_capabilities: Some(caps),
+                    ..Default::default()
+                };
 
-            let (source, track, _feedback_rx) = sample_track(MediaKind::Video, 120);
+                let pc = PeerConnection::new(config);
 
-            pc.add_track(
-                track,
-                RtpCodecParameters {
-                    payload_type: 96,
-                    clock_rate: RTP_CLOCK_RATE,
-                    channels: 0,
-                },
-            )
-            .map_err(|e| e.to_string())?;
+                let (source, track, _feedback_rx) = sample_track(MediaKind::Video, 120);
 
-            let offer = pc.create_offer().await.map_err(|e| e.to_string())?;
-            pc.set_local_description(offer)
+                pc.add_track(
+                    track,
+                    RtpCodecParameters {
+                        payload_type: 96,
+                        clock_rate: RTP_CLOCK_RATE,
+                        channels: 0,
+                    },
+                )
                 .map_err(|e| e.to_string())?;
 
-            tokio::time::timeout(Duration::from_secs(3), pc.wait_for_gathering_complete())
-                .await
-                .ok();
+                let offer = pc.create_offer().await.map_err(|e| e.to_string())?;
+                pc.set_local_description(offer)
+                    .map_err(|e| e.to_string())?;
 
-            let offer_sdp = pc
-                .local_description()
-                .ok_or("no local desc")?
-                .to_sdp_string();
+                tokio::time::timeout(Duration::from_secs(3), pc.wait_for_gathering_complete())
+                    .await
+                    .ok();
 
-            let pc_c = pc.clone();
-            let stop_c = stop.clone();
-            tokio::spawn(async move {
-                while !stop_c.load(Ordering::Relaxed) {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-                pc_c.close();
-            });
+                let offer_sdp = pc
+                    .local_description()
+                    .ok_or("no local desc")?
+                    .to_sdp_string();
 
-            Ok::<_, String>((pc, source, offer_sdp))
+                let pc_c = pc.clone();
+                tokio::spawn(async move {
+                    notify_c.notified().await;
+                    pc_c.close();
+                });
+
+                Ok::<_, String>((pc, source, offer_sdp))
+            }
         })?;
 
         Ok(WebRtcHandle {
@@ -100,6 +103,7 @@ impl WebRtcHandle {
             rtp_timestamp: AtomicU32::new(0),
             rtp_ts_per_frame: RTP_CLOCK_RATE / fps.max(1),
             rt,
+            stop_notify,
         })
     }
 
@@ -125,6 +129,7 @@ impl WebRtcHandle {
     /// Close the PeerConnection inside the Tokio runtime context.
     /// Safe to call from any thread.
     pub fn close(&self) {
+        self.stop_notify.notify_one();
         let pc = self.pc.clone();
         self.rt.block_on(async move {
             pc.close();
@@ -174,6 +179,12 @@ impl WebRtcHandle {
             }
             Ok(())
         })
+    }
+}
+
+impl Drop for WebRtcHandle {
+    fn drop(&mut self) {
+        self.stop_notify.notify_one();
     }
 }
 
@@ -300,5 +311,23 @@ mod tests {
         assert_eq!(packets[1].0[1] & 0xC0, 0); // continuation (no S/E)
         assert_eq!(packets[2].0[1] & 0x80, 0);
         assert_ne!(packets[2].0[1] & 0x40, 0); // end
+    }
+
+    #[test]
+    fn packetize_fua_mtu_plus_one() {
+        // NAL exactly 1 byte larger than MTU → two FU-A fragments
+        let mut nal = vec![0x65];
+        nal.extend(std::iter::repeat_n(0xFF, 1200)); // total 1201 bytes
+        let packets = packetize_nal(nal, true, 1200);
+        assert_eq!(packets.len(), 2, "MTU+1 should produce 2 fragments");
+        // First fragment: FU-A start bit set, max_chunk=1198 bytes + 2 header = 1200
+        assert_eq!(packets[0].0.len(), 1200);
+        assert_ne!(packets[0].0[1] & 0x80, 0); // start
+        assert_eq!(packets[0].0[1] & 0x40, 0);
+        // Second fragment: FU-A end bit set, remaining 2 bytes
+        assert_eq!(packets[1].0.len(), 2 + 2); // 2 remaining bytes + 2 header
+        assert_eq!(packets[1].0[1] & 0x80, 0);
+        assert_ne!(packets[1].0[1] & 0x40, 0); // end
+        assert!(packets[1].1); // is_last propagated
     }
 }

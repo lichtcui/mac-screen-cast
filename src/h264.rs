@@ -33,7 +33,7 @@ extern "C" {
 impl VtEncoder {
     pub fn new(width: u32, height: u32, fps: u32) -> Result<Self, String> {
         // Heuristic: 0.07 bits per pixel per frame, clamped to [500 Kbps, 10 Mbps]
-        let bitrate = ((width as f64 * height as f64 * fps as f64 * 0.07) as u32)
+        let bitrate = ((width * height * fps * 7) / 100)
             .clamp(500_000, 10_000_000);
         let session = CompressionSession::builder(width as i32, height as i32, Codec::H264)
             .with_profile_level(ProfileLevel::H264ConstrainedBaselineAutoLevel)
@@ -234,6 +234,18 @@ mod tests {
         let units = avcc_nal_units(&data);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].0, &[0x41, 0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn avcc_nal_units_zero_length_mid() {
+        // Zero-length NAL in the middle should stop parsing
+        let n1 = avcc(0x41, &[1, 2, 3]);
+        let zero = [0x00, 0x00, 0x00, 0x00];
+        let n2 = avcc(0x41, &[4, 5, 6]);
+        let data = [n1.as_slice(), zero.as_slice(), n2.as_slice()].concat();
+        let units = avcc_nal_units(&data);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].0, &[0x41, 1, 2, 3]);
     }
 
     #[test]

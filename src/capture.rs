@@ -22,7 +22,7 @@ pub struct CaptureSession {
 
 impl CaptureSession {
     pub fn new<H>(
-        window_id: u32,
+        filter: SCContentFilter,
         output_width: u32,
         output_height: u32,
         fps: u32,
@@ -31,23 +31,6 @@ impl CaptureSession {
     where
         H: FnMut(CMSampleBuffer, SCStreamOutputType) + Send + 'static,
     {
-        let content = SCShareableContent::get().map_err(|e| {
-            format!(
-                "SCShareableContent error: {}. \
-                 Grant Screen Recording permission in \
-                 System Settings > Privacy & Security > Screen Recording.",
-                e
-            )
-        })?;
-
-        let windows = content.windows();
-        let window = windows
-            .iter()
-            .find(|w| w.window_id() == window_id)
-            .ok_or_else(|| format!("Window {} not found", window_id))?;
-
-        let filter = SCContentFilter::create().with_window(window).build();
-
         let mut config = SCStreamConfiguration::default();
         config
             .set_width(output_width)
@@ -60,8 +43,8 @@ impl CaptureSession {
         let stop_c = stop.clone();
 
         let join_handle = thread::spawn(move || {
+            let mut next_frame = Instant::now();
             while !stop_c.load(Ordering::Relaxed) {
-                let loop_start = Instant::now();
                 match SCScreenshotManager::capture_sample_buffer(&filter, &config) {
                     Ok(sample) => {
                         handler(sample, SCStreamOutputType::Screen);
@@ -70,9 +53,12 @@ impl CaptureSession {
                         eprintln!("  Screenshot capture error: {}", e);
                     }
                 }
-                let elapsed = loop_start.elapsed();
-                if elapsed < interval {
-                    thread::sleep(interval - elapsed);
+                next_frame += interval;
+                let now = Instant::now();
+                if next_frame > now {
+                    thread::sleep(next_frame - now);
+                } else {
+                    next_frame = now;
                 }
             }
         });
