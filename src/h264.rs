@@ -15,7 +15,10 @@ pub struct VtEncoder {
     session: CompressionSession,
 }
 
-// VideoToolbox CompressionSession handles are thread-safe.
+// SAFETY: VideoToolbox CompressionSession handles (`VTCompressionSessionRef`) are
+// documented as thread-safe by Apple. All internal state is protected by the
+// framework. This is safe even though `CompressionSession` doesn't implement
+// `Send`/`Sync` itself.
 unsafe impl Send for VtEncoder {}
 unsafe impl Sync for VtEncoder {}
 

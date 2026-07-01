@@ -63,10 +63,23 @@ pub fn html(fps: u32, title: &str) -> String {
 	</script>"#.replace("ScreenStream", title).replace("{{FPS}}", &fps.to_string())
 }
 
-/// Get local IP address.
+/// Get local IP address by probing common network interfaces.
+/// Tries en0 (Wi-Fi) first, then en1–en9 (USB tethering, Thunderbolt, etc.),
+/// falling back to 127.0.0.1 if none are found.
 pub fn get_ip() -> String {
-    Command::new("sh").arg("-c").arg("ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1")
-        .output().map(|o| String::from_utf8_lossy(&o.stdout).trim().into()).unwrap_or_default()
+    for iface in &["en0", "en1", "en2", "en3", "en4", "en5", "en6", "en7", "en8", "en9"] {
+        if let Ok(out) = Command::new("sh")
+            .arg("-c")
+            .arg(format!("ipconfig getifaddr {} 2>/dev/null", iface))
+            .output()
+        {
+            let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !ip.is_empty() && ip.contains('.') {
+                return ip;
+            }
+        }
+    }
+    String::from("127.0.0.1")
 }
 
 #[cfg(test)]

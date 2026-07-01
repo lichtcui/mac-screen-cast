@@ -206,9 +206,8 @@ impl WebRtcHandle {
 
         for (nal, is_last) in crate::h264::avcc_nal_units(&frame.data) {
             if frame.is_keyframe {
-                match nal.first().map(|b| b & 0x1f) {
-                    Some(7) | Some(8) => continue,
-                    _ => {}
+                if let Some(7 | 8) = nal.first().map(|b| b & 0x1f) {
+                    continue;
                 }
             }
             rtp_packets.extend(packetize_nal(nal, is_last, RTP_MTU));
@@ -361,6 +360,45 @@ mod tests {
         assert_eq!(packets[1].0[1] & 0xC0, 0); // continuation (no S/E)
         assert_eq!(packets[2].0[1] & 0x80, 0);
         assert_ne!(packets[2].0[1] & 0x40, 0); // end
+    }
+
+    #[test]
+    fn packetize_fua_large_nal_integrity() {
+        // Generate a 10 KB NAL with random payload, fragment it, then
+        // verify the FU-A fragments reconstruct the original nal_type + payload.
+        let nal_type: u8 = 0x65; // IDR slice
+        let payload_size = 10_240;
+        let mut nal = vec![nal_type];
+        nal.extend((0..payload_size).map(|i| (i % 251) as u8));
+        let mtu = 1200;
+
+        let packets = packetize_nal(nal.clone(), true, mtu);
+        assert!(packets.len() > 8, "10KB NAL should produce many fragments: {}", packets.len());
+
+        // Reassemble: collect all FU-A payloads
+        let mut reconstructed = Vec::new();
+        for (i, (payload, _)) in packets.iter().enumerate() {
+            assert!(payload.len() <= mtu, "fragment {} exceeds MTU: {}", i, payload.len());
+            let fu_indicator = payload[0];
+            let fu_header = payload[1];
+            // Verify FU-A indicator (NAL type 28 = 0x1c) with same NRI
+            assert_eq!(fu_indicator & 0x1f, 28, "fragment {}: not FU-A", i);
+            assert_eq!(fu_indicator & 0x60, nal_type & 0x60, "fragment {}: NRI mismatch", i);
+            // Verify FU header
+            let is_start = (fu_header & 0x80) != 0;
+            let is_end = (fu_header & 0x40) != 0;
+            assert_eq!(is_start, i == 0, "fragment {}: start bit", i);
+            assert_eq!(is_end, i == packets.len() - 1, "fragment {}: end bit", i);
+            assert_eq!(fu_header & 0x1f, nal_type & 0x1f, "fragment {}: NAL type", i);
+            // Append payload (skipping 2-byte FU-A header)
+            reconstructed.extend_from_slice(&payload[2..]);
+        }
+
+        // Reconstructed payload should match original (skip nal_type byte)
+        assert_eq!(reconstructed, nal[1..], "reconstructed payload mismatch");
+
+        // Last packet should carry is_last_nal flag
+        assert!(packets.last().unwrap().1, "last fragment should have is_last=true");
     }
 
     #[test]

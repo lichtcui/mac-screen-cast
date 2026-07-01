@@ -3,11 +3,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use screencapturekit::cm::CMSampleBuffer;
 use screencapturekit::prelude::*;
 use screencapturekit::screenshot_manager::SCScreenshotManager;
-use screencapturekit::stream::configuration::SCStreamConfiguration;
-use screencapturekit::stream::content_filter::SCContentFilter;
 
 /// Polling-based window capture using `SCScreenshotManager`.
 ///
@@ -27,7 +24,7 @@ impl CaptureSession {
         output_height: u32,
         fps: u32,
         mut handler: H,
-    ) -> Result<Self, String>
+    ) -> Self
     where
         H: FnMut(CMSampleBuffer, SCStreamOutputType) + Send + 'static,
     {
@@ -38,7 +35,7 @@ impl CaptureSession {
             .set_pixel_format(PixelFormat::BGRA)
             .set_shows_cursor(false);
 
-        let interval = Duration::from_secs_f64(1.0 / fps as f64);
+        let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
         let stop = Arc::new(AtomicBool::new(false));
         let stop_c = stop.clone();
 
@@ -63,10 +60,10 @@ impl CaptureSession {
             }
         });
 
-        Ok(CaptureSession {
+        CaptureSession {
             stop,
             join_handle: Some(join_handle),
-        })
+        }
     }
 
     pub fn stop(&mut self) {

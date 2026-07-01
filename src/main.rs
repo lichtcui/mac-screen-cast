@@ -6,16 +6,20 @@ mod webrtc;
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use screencapturekit::cm::CMSampleBuffer;
 use screencapturekit::prelude::*;
-use screencapturekit::stream::content_filter::SCContentFilter;
 
-fn lock_mutex<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+/// Helper: acquire RwLock read guard, recovering from a poisoned lock.
+fn rw_read<'a, T>(rw: &'a RwLock<T>) -> std::sync::RwLockReadGuard<'a, T> {
+    rw.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Helper: acquire RwLock write guard, recovering from a poisoned lock.
+fn rw_write<'a, T>(rw: &'a RwLock<T>) -> std::sync::RwLockWriteGuard<'a, T> {
+    rw.write().unwrap_or_else(|e| e.into_inner())
 }
 
 fn main() {
@@ -41,7 +45,7 @@ fn main() {
                     eprintln!("Missing value for --window-id");
                     break;
                 }
-                wid = args[i].parse().unwrap_or(0);
+                wid = args[i].parse().unwrap_or_else(|_| { eprintln!("  Warning: ignoring invalid --window-id '{}'", args[i]); 0 });
             }
             "--width" => {
                 i += 1;
@@ -49,7 +53,7 @@ fn main() {
                     eprintln!("Missing value for --width");
                     break;
                 }
-                max_w = args[i].parse().unwrap_or(1280);
+                max_w = args[i].parse().unwrap_or_else(|_| { eprintln!("  Warning: ignoring invalid --width '{}'", args[i]); 1280 });
             }
             "--fps" => {
                 i += 1;
@@ -57,7 +61,7 @@ fn main() {
                     eprintln!("Missing value for --fps");
                     break;
                 }
-                fps = args[i].parse().unwrap_or(30).clamp(1, 60);
+                fps = args[i].parse().unwrap_or_else(|_| { eprintln!("  Warning: ignoring invalid --fps '{}'", args[i]); 30 }).clamp(1, 60);
             }
             "--port" => {
                 i += 1;
@@ -65,7 +69,7 @@ fn main() {
                     eprintln!("Missing value for --port");
                     break;
                 }
-                port = args[i].parse().unwrap_or(8080);
+                port = args[i].parse().unwrap_or_else(|_| { eprintln!("  Warning: ignoring invalid --port '{}'", args[i]); 8080 });
             }
             "--json" => json_output = true,
             "-l" | "--list" => {
@@ -207,7 +211,7 @@ fn main() {
     };
 
     // ── Channel: encoded frames (+ capture timestamp) → WebRTC sender ──
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<(h264::H264Frame, Instant)>(60);
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<(h264::H264Frame, Instant)>(15);
 
     // ── Channel: raw frames (capture → encoder thread, small buffer for low latency) ──
     struct RawFrame {
@@ -238,13 +242,14 @@ fn main() {
     // Capture thread now only takes screenshots and pushes to raw_tx;
     // encoding runs here in parallel so capture of frame N+1 overlaps
     // with encoding of frame N.
+    let encoder_timeout = Duration::from_millis((1000 / fps).max(16) as u64);
     let encoder_thread = {
         let encoder = encoder.clone();
         let frame_tx = frame_tx.clone();
         let stop_c = stop.clone();
         thread::spawn(move || {
             while !stop_c.load(Ordering::Relaxed) {
-                match raw_rx.recv_timeout(Duration::from_millis(100)) {
+                match raw_rx.recv_timeout(encoder_timeout) {
                     Ok(raw) => {
                         if let Some(pb) = raw.sample.image_buffer() {
                             if let Some(surface) = pb.io_surface() {
@@ -273,7 +278,7 @@ fn main() {
     let webrtc_rt = Arc::new(
         tokio::runtime::Runtime::new().expect("create Tokio runtime for WebRTC"),
     );
-    let wr_handle: Arc<Mutex<Option<webrtc::WebRtcHandle>>> = Arc::new(Mutex::new(None));
+    let wr_handle: Arc<RwLock<Option<webrtc::WebRtcHandle>>> = Arc::new(RwLock::new(None));
     let wr_version = Arc::new(AtomicU64::new(0));
     let srv_wr_conn = Arc::new(AtomicBool::new(false));
     let srv_wr = wr_handle.clone();
@@ -341,25 +346,25 @@ fn main() {
                     // Refresh: close old PeerConnection, create new one
                     let was_connected = srv_wr_conn.swap(false, Ordering::Relaxed);
                     if was_connected {
-                        // Close old PC inside the shared runtime
-                        {
-                            let guard = lock_mutex(&srv_wr);
-                            if let Some(ref wr) = *guard {
-                                wr.close();
-                            }
+                        // Clone the old handle out of the RwLock so we can
+                        // call close() (which blocks on Tokio) without holding
+                        // the lock. This avoids any risk of write-starvation.
+                        let old = rw_read(&srv_wr).clone();
+                        if let Some(ref wr) = old {
+                            wr.close();
                         }
                         // Create replacement PeerConnection on the same runtime
                         if let Ok(new_handle) =
                             webrtc::WebRtcHandle::new(srv_rt.handle().clone(), fps, out_w, out_h)
                         {
-                            *lock_mutex(&srv_wr) = Some(new_handle);
+                            *rw_write(&srv_wr) = Some(new_handle);
                             srv_wr_ver.fetch_add(1, Ordering::Release);
                             eprintln!("\n  WebRTC offer recreated for refresh");
                         } else {
                             eprintln!("\n  WebRTC recreate failed");
                         }
                     }
-                    match lock_mutex(&srv_wr).as_ref() {
+                    match rw_read(&srv_wr).as_ref() {
                         Some(wr) => Response::from_data(wr.offer.clone().into_bytes())
                             .with_header(
                                 "Content-Type: application/sdp"
@@ -373,7 +378,7 @@ fn main() {
                     let mut ok = false;
                     let mut body = String::new();
                     if req.as_reader().read_to_string(&mut body).is_ok() {
-                        if let Some(ref wr) = *lock_mutex(&srv_wr) {
+                        if let Some(ref wr) = *rw_read(&srv_wr) {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                                 if let Some(sdp) = v["sdp"].as_str() {
                                     if wr.set_answer(sdp.to_string()).is_ok() {
@@ -420,7 +425,7 @@ fn main() {
         match webrtc::WebRtcHandle::new(webrtc_rt.handle().clone(), fps, out_w, out_h) {
             Ok(handle) => {
                 eprintln!("  WebRTC offer ready");
-                *lock_mutex(&wr_handle) = Some(handle);
+                *rw_write(&wr_handle) = Some(handle);
                 wr_version.fetch_add(1, Ordering::Release);
             }
             Err(e) => eprintln!("  WebRTC init failed: {}", e),
@@ -433,7 +438,7 @@ fn main() {
     let frame_count = Arc::new(AtomicU64::new(0));
     let frame_count_cb = frame_count.clone();
 
-    let mut capture_session = match capture::CaptureSession::new(
+    let mut capture_session = capture::CaptureSession::new(
         capture_filter,
         out_w,
         out_h,
@@ -445,13 +450,7 @@ fn main() {
                 stop_for_cap.store(true, Ordering::Relaxed);
             }
         },
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{e}");
-            return;
-        }
-    };
+    );
 
     // ── Main loop: receive encoded frames → WebRTC ──
     let mut send_count: u64 = 0;
@@ -462,7 +461,7 @@ fn main() {
 
     // Cache the WebRTC handle to avoid locking every frame.
     // Re-clone when HTTP thread refreshes (page reload).
-    let mut wr_cached: Option<webrtc::WebRtcHandle> = lock_mutex(&wr_handle).clone();
+    let mut wr_cached: Option<webrtc::WebRtcHandle> = rw_read(&wr_handle).clone();
     let mut wr_ver = wr_version.load(Ordering::Acquire);
 
     while !stop.load(Ordering::Relaxed) {
@@ -471,7 +470,7 @@ fn main() {
                 // Re-read handle if HTTP thread replaced it on refresh
                 let v = wr_version.load(Ordering::Acquire);
                 if v != wr_ver {
-                    wr_cached = lock_mutex(&wr_handle).clone();
+                    wr_cached = rw_read(&wr_handle).clone();
                     wr_ver = v;
                 }
 
@@ -517,8 +516,12 @@ fn main() {
         }
     }
 
-    // Cleanup (order: capture → encoder → server)
+    // Cleanup (order: capture → encoder → server → runtime)
     capture_session.stop();
     encoder_thread.join().ok();
     srv.join().ok();
+    // Explicitly drop the runtime to shut down all spawned WebRTC tasks
+    // before the process exits. The runtime Arc is still held by webrtc_rt
+    // on this stack frame (srv_rt inside the server thread was dropped on join).
+    drop(webrtc_rt);
 }
