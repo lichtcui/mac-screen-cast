@@ -39,17 +39,28 @@ impl CaptureSession {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_c = stop.clone();
 
+        const CAPTURE_ERROR_THROTTLE: Duration = Duration::from_secs(5);
+
         let join_handle = thread::spawn(move || {
             let mut next_frame = Instant::now();
+            let mut last_error_log = Instant::now();
+
             while !stop_c.load(Ordering::Relaxed) {
                 match SCScreenshotManager::capture_sample_buffer(&filter, &config) {
                     Ok(sample) => {
                         handler(sample, SCStreamOutputType::Screen);
                     }
                     Err(e) => {
-                        eprintln!("  Screenshot capture error: {}", e);
+                        let now = Instant::now();
+                        if now - last_error_log >= CAPTURE_ERROR_THROTTLE {
+                            eprintln!("  Screenshot capture error: {}", e);
+                            last_error_log = now;
+                        }
                     }
                 }
+                // Drift-compensated frame timing:
+                // targets `interval` between frames, resets if we fall behind
+                // (e.g. a slow screenshot). This avoids accumulating delay.
                 next_frame += interval;
                 let now = Instant::now();
                 if next_frame > now {

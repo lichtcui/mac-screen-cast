@@ -7,8 +7,18 @@ license = "MIT"
 repository = "https://github.com/lichtcui/mac-screen-cast"
 keywords = ["macos", "screen-capture", "webRTC", "h264", "videotoolbox"]
 categories = ["multimedia::video", "command-line-utilities"]
+include = [
+    "/src",
+    "/resources",
+    "/benches",
+    "/Cargo.toml",
+    "/build.rs",
+    "/LICENSE",
+    "/README.md",
+]
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 tiny_http = "0.12"
 ctrlc = "3.4"
 bytes = "1"
@@ -23,6 +33,14 @@ apple-cf = { version = "0.9", default-features = false, features = ["iosurface"]
 qrcode = "0.14"
 ureq = "2"
 spin_sleep = "1"
+static_assertions = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "packetization"
+harness = false
 
 [profile.release]
 opt-level = 3

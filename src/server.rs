@@ -1,7 +1,7 @@
 use std::process::Command;
 
 /// A visible window.
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct Window {
     pub id: u32,
     pub app: String,
@@ -20,10 +20,19 @@ for x in w { if let n = x[kCGWindowName as String] as? String, !n.isEmpty,
                   print("\(x[kCGWindowNumber as String] as! NSNumber) ||| \(o) ||| \(n)") } }
 "#;
     let out = match Command::new("swift").arg("-e").arg(script).output() {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
+        Ok(o) => {
+            if !o.status.success() {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                eprintln!("  Window listing failed: swift exited with error:\n{}", stderr.trim());
+                return Vec::new();
+            }
+            o
+        }
+        Err(e) => {
+            eprintln!("  Window listing failed: could not run swift -e: {}", e);
+            return Vec::new();
+        }
     };
-    if !out.status.success() { return Vec::new(); }
     String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| {
         let p: Vec<&str> = l.trim().split(" ||| ").collect();
         if p.len() >= 3 { Some(Window { id: p[0].parse().ok()?, app: p[1].into(), title: p[2].into() }) } else { None }
@@ -36,41 +45,36 @@ pub fn list_windows_json() -> String {
 }
 
 /// WebRTC video page with real-time latency display.
+///
+/// Template uses `{{TITLE}}` and `{{FPS}}` placeholders,
+/// defined in `resources/player.html`.
 pub fn html(fps: u32, title: &str) -> String {
-    r#"<!DOCTYPE html><html><meta charset="utf-8"><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>ScreenStream</title><style>*{margin:0;background:#000}body{display:flex;min-height:100vh;min-height:100dvh;align-items:center;justify-content:center}video{width:100%;max-height:100vh;max-height:100dvh}#b{position:fixed;bottom:0;left:0;right:0;display:flex;gap:12px;padding:3px 10px;background:rgba(0,0,0,.5);color:#aaa;font:11px/1.3 monospace;z-index:99;user-select:none}}.g{color:#4a4}.r{color:#c44}</style><body><video id=v autoplay muted playsinline></video><div id=b><span id=st class=r>{{FPS}}fps connecting</span></div><script>
-	var v=document.getElementById('v'),st=document.getElementById('st'),pc;
-	fetch('/offer').then(r=>r.text()).then(async o=>{
-	pc=new RTCPeerConnection();
-	pc.ontrack=e=>{v.srcObject=e.streams[0];v.play().catch(()=>{});v.onloadedmetadata=()=>st.className='g'};
-	pc.oniceconnectionstatechange=()=>{var s=pc.iceConnectionState;st.textContent='{{FPS}}fps '+s;if(s==='failed')console.log('ICE failed')};
-	pc.onicecandidateerror=e=>console.warn('ICE candidate error:',e.errorText||'timeout',e.url||'');
-	setInterval(async()=>{
-	  try{
-	    var lat=await(await fetch('/latency')).text();
-	    st.textContent='{{FPS}}fps | '+lat+'ms'
-	  }catch(e){}
-	},1000);
-	var candidates=[];
-	pc.onicecandidate=e=>{if(e.candidate)candidates.push({candidate:e.candidate.candidate,sdpMid:e.candidate.sdpMid,sdpMLineIndex:e.candidate.sdpMLineIndex})};
-	pc.addTransceiver('video',{direction:'recvonly'});
-	await pc.setRemoteDescription({type:'offer',sdp:o});
-	var a=await pc.createAnswer();
-	await pc.setLocalDescription(a);
-	await new Promise(r=>{if(pc.iceGatheringState==='complete')r();else pc.onicegatheringstatechange=ev=>{if(pc.iceGatheringState==='complete')r()}});
-	var msg={sdp:a.sdp,candidates:candidates};
-	fetch('/signal',{method:'POST',body:JSON.stringify(msg)})
-	}).catch(e=>{st.textContent='error: '+e.message;st.className='r'})
-	</script>"#.replace("ScreenStream", title).replace("{{FPS}}", &fps.to_string())
+    include_str!("../resources/player.html")
+        .replace("{{TITLE}}", title)
+        .replace("{{FPS}}", &fps.to_string())
 }
 
-/// Get local IP address by probing common network interfaces.
-/// Tries en0 (Wi-Fi) first, then en1–en9 (USB tethering, Thunderbolt, etc.),
-/// falling back to 127.0.0.1 if none are found.
+/// Get local IP address of the default route interface.
+///
+/// Uses `route get default` to find the primary interface, then queries
+/// its IP with `ipconfig getifaddr`. Falls back to probing en0/en1 directly,
+/// then 127.0.0.1. Typically completes in 2 process spawns instead of 10.
 pub fn get_ip() -> String {
-    for iface in &["en0", "en1", "en2", "en3", "en4", "en5", "en6", "en7", "en8", "en9"] {
-        if let Ok(out) = Command::new("sh")
-            .arg("-c")
-            .arg(format!("ipconfig getifaddr {} 2>/dev/null", iface))
+    // Find the default route interface name with a single `route get` call
+    let default_iface = Command::new("sh")
+        .arg("-c")
+        .arg("route get default 2>/dev/null | grep 'interface:' | awk '{print $2}'")
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !s.is_empty() { Some(s) } else { None }
+        });
+
+    if let Some(ref iface) = default_iface {
+        if let Ok(out) = Command::new("ipconfig")
+            .arg("getifaddr")
+            .arg(iface)
             .output()
         {
             let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -79,6 +83,17 @@ pub fn get_ip() -> String {
             }
         }
     }
+
+    // Fallback: probe common interfaces directly (no shell wrapper needed)
+    for iface in &["en0", "en1", "en2"] {
+        if let Ok(out) = Command::new("ipconfig").arg("getifaddr").arg(iface).output() {
+            let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !ip.is_empty() && ip.contains('.') {
+                return ip;
+            }
+        }
+    }
+
     String::from("127.0.0.1")
 }
 

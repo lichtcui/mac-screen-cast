@@ -3,11 +3,23 @@ use std::ffi::c_void;
 use videotoolbox::compression::{CompressionSession, EncodedFrame, ProfileLevel};
 use videotoolbox::session::Codec;
 
-#[derive(Clone)]
+/// An encoded H.264 frame in AVCC format.
+///
+/// AVCC format uses 4-byte big-endian length prefixes before each NAL unit
+/// (as opposed to Annex B's start code `0x00000001`). This is the native
+/// output format of VideoToolbox on macOS.
+///
+/// Note: `H264Frame` is **moved** through the pipeline (capture → encode →
+/// send), never cloned. If a Clone impl is ever needed, add `#[derive(Clone)]`
+/// back — all fields implicitly support Clone.
 pub struct H264Frame {
+    /// Compressed frame data: AVCC-format bytes
     pub data: Vec<u8>,
+    /// `true` if this is an IDR (key) frame
     pub is_keyframe: bool,
+    /// Sequence parameter set (present on keyframes only)
     pub sps: Option<Vec<u8>>,
+    /// Picture parameter set (present on keyframes only)
     pub pps: Option<Vec<u8>>,
 }
 
@@ -22,6 +34,10 @@ pub struct VtEncoder {
 unsafe impl Send for VtEncoder {}
 unsafe impl Sync for VtEncoder {}
 
+// Compile-time guard: if VtEncoder's fields ever change to include a non-Send/Sync
+// type, this assertion will catch it before any threaded usage breaks at runtime.
+static_assertions::assert_impl_all!(VtEncoder: Send, Sync);
+
 extern "C" {
     fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
         desc: *mut c_void,
@@ -35,7 +51,16 @@ extern "C" {
 
 impl VtEncoder {
     pub fn new(width: u32, height: u32, fps: u32) -> Result<Self, String> {
-        // Heuristic: 0.07 bits per pixel per frame, clamped to [500 Kbps, 10 Mbps]
+        // Bitrate heuristic: 0.07 bits per pixel per frame ≈ bpp * w * h * fps.
+        // 0.07 bpp is a conservative sweet spot for screen content (code UI/text)
+        // at 720p–1080p — sharp enough for readable text, no visible banding.
+        // Clamped to [500 Kbps, 10 Mbps] to avoid crippling low-res captures
+        // or wasting bandwidth on very high-resolution displays.
+        //
+        // | Resolution | @30fps | @60fps |
+        // |------------|--------|--------|
+        // | 1280x720   | ~2 Mb  | ~4 Mb  |
+        // | 1920x1080  | ~4 Mb  | ~8 Mb  |
         let bitrate = ((width * height * fps * 7) / 100)
             .clamp(500_000, 10_000_000);
         let session = CompressionSession::builder(width as i32, height as i32, Codec::H264)
@@ -50,6 +75,19 @@ impl VtEncoder {
         Ok(VtEncoder { session })
     }
 
+    /// Encode an IOSurface into an H.264 frame.
+    ///
+    /// Blocks until VideoToolbox returns the compressed frame.
+    /// Keyframes (IDR) include extracted SPS/PPS parameter sets.
+    ///
+    /// # Arguments
+    /// * `surface` — GPU-resident pixel buffer (zero-copy, no CPU readback)
+    /// * `frame_num` — sequence number, used as PTS (presentation timestamp)
+    /// * `fps` — timescale for `frame_num` (e.g. 30 → pts = frame_num/30)
+    ///
+    /// # Returns
+    /// `H264Frame` with AVCC-format data (4-byte length prefix per NAL unit),
+    /// plus SPS/PPS on keyframes.
     pub fn encode(
         &self,
         surface: &apple_cf::iosurface::IOSurface,
@@ -63,25 +101,32 @@ impl VtEncoder {
 
         let is_keyframe = (encoded.info_flags & 1) != 0;
 
-        let (sps, pps) = if is_keyframe {
+        let params = if is_keyframe {
             extract_sps_pps(&encoded)
         } else {
-            (None, None)
+            ParamSets { sps: None, pps: None }
         };
 
         Ok(H264Frame {
             data: encoded.data,
             is_keyframe,
-            sps,
-            pps,
+            sps: params.sps,
+            pps: params.pps,
         })
     }
 }
 
-fn extract_sps_pps(encoded: &EncodedFrame) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+/// SPS (Sequence Parameter Set) and PPS (Picture Parameter Set) extracted
+/// from a VideoToolbox keyframe's format description.
+struct ParamSets {
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+}
+
+fn extract_sps_pps(encoded: &EncodedFrame) -> ParamSets {
     let sb = match encoded.cm_sample_buffer() {
         Some(sb) => sb,
-        None => return (None, None),
+        None => return ParamSets { sps: None, pps: None },
     };
 
     // SAFETY: CMSampleBufferGetFormatDescription is a CoreMedia C API.
@@ -90,7 +135,7 @@ fn extract_sps_pps(encoded: &EncodedFrame) -> (Option<Vec<u8>>, Option<Vec<u8>>)
         videotoolbox::ffi::CMSampleBufferGetFormatDescription(sb.as_ptr().cast())
     } as *mut c_void;
     if fmt_desc.is_null() {
-        return (None, None);
+        return ParamSets { sps: None, pps: None };
     }
 
     // SAFETY: This FFI reads SPS/PPS parameter sets from a CoreMedia format
@@ -137,7 +182,7 @@ fn extract_sps_pps(encoded: &EncodedFrame) -> (Option<Vec<u8>>, Option<Vec<u8>>)
             }
         }
 
-        (sps, pps)
+        ParamSets { sps, pps }
     }
 }
 

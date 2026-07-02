@@ -105,9 +105,12 @@ impl WebRtcHandle {
                 pc.set_local_description(offer)
                     .map_err(|e| e.to_string())?;
 
-                tokio::time::timeout(Duration::from_secs(3), pc.wait_for_gathering_complete())
+                if tokio::time::timeout(Duration::from_secs(3), pc.wait_for_gathering_complete())
                     .await
-                    .ok();
+                    .is_err()
+                {
+                    eprintln!("  ICE gathering timed out after 3s — offer may lack full candidates");
+                }
 
                 let offer_sdp = pc
                     .local_description()
@@ -237,11 +240,16 @@ impl Drop for WebRtcHandle {
     }
 }
 
+// WebRtcHandle is stored inside Arc<RwLock<Option<...>>> and shared across
+// threads (main pipeline + HTTP server). The Send assertion catches any
+// future field additions that might break thread safety.
+static_assertions::assert_impl_all!(WebRtcHandle: Send);
+
 /// Packetize a NAL unit into one or more RTP payloads.
 ///
 /// NAL units smaller than `mtu` are sent as a single packet.
 /// Larger units are fragmented using FU-A (RFC 6184).
-pub(crate) fn packetize_nal(
+pub fn packetize_nal(
     data: Vec<u8>,
     is_last_nal: bool,
     mtu: usize,

@@ -6,11 +6,7 @@ fn binary_path() -> std::path::PathBuf {
     if dir.ends_with("deps") {
         dir.pop(); // target/debug/ or target/release/
     }
-    dir.join(if cfg!(target_os = "windows") {
-        "mac-screen-cast.exe"
-    } else {
-        "mac-screen-cast"
-    })
+    dir.join("mac-screen-cast")
 }
 
 #[test]

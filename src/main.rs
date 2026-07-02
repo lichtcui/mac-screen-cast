@@ -10,7 +10,35 @@ use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use clap::Parser;
 use screencapturekit::prelude::*;
+use tiny_http::Header;
+
+// ── Content-Type header helpers (hardcoded strings, parse cannot fail) ──
+
+fn header_html() -> Header {
+    "Content-Type: text/html; charset=utf-8"
+        .parse()
+        .expect("valid Content-Type: text/html")
+}
+
+fn header_sdp() -> Header {
+    "Content-Type: application/sdp"
+        .parse()
+        .expect("valid Content-Type: application/sdp")
+}
+
+fn header_json() -> Header {
+    "Content-Type: application/json"
+        .parse()
+        .expect("valid Content-Type: application/json")
+}
+
+fn header_text() -> Header {
+    "Content-Type: text/plain"
+        .parse()
+        .expect("valid Content-Type: text/plain")
+}
 
 /// Helper: acquire RwLock read guard, recovering from a poisoned lock.
 fn rw_read<'a, T>(rw: &'a RwLock<T>) -> std::sync::RwLockReadGuard<'a, T> {
@@ -22,275 +50,259 @@ fn rw_write<'a, T>(rw: &'a RwLock<T>) -> std::sync::RwLockWriteGuard<'a, T> {
     rw.write().unwrap_or_else(|e| e.into_inner())
 }
 
-fn main() {
-    update_checker::check();
+// ── CLI argument parsing via clap derive ──
 
-    let _ = rustls::crypto::CryptoProvider::install_default(
-        rustls::crypto::ring::default_provider(),
-    );
-    let args: Vec<String> = std::env::args().collect();
-    let mut wid: u32 = 0;
-    let mut window_name = String::from("mac-screen-cast");
-    let mut max_w: u32 = 1280;
-    let mut fps: u32 = 30;
-    let mut port: u16 = 8080;
-    let mut json_output = false;
+#[derive(Parser)]
+#[command(
+    name = "mac-screen-cast",
+    version,
+    about = "Stream macOS screen to browser over LAN",
+    after_help = "\
+EXAMPLES:
+  mac-screen-cast -l --json              List windows as JSON
+  mac-screen-cast -w 12345 --width 720   Stream at 720p
+  mac-screen-cast -w 12345 --fps 60      Stream at 60 fps
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-w" | "--window-id" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("Missing value for --window-id");
-                    break;
-                }
-                wid = args[i].parse().unwrap_or_else(|_| { eprintln!("  Warning: ignoring invalid --window-id '{}'", args[i]); 0 });
-            }
-            "--width" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("Missing value for --width");
-                    break;
-                }
-                max_w = args[i].parse().unwrap_or_else(|_| { eprintln!("  Warning: ignoring invalid --width '{}'", args[i]); 1280 });
-            }
-            "--fps" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("Missing value for --fps");
-                    break;
-                }
-                fps = args[i].parse().unwrap_or_else(|_| { eprintln!("  Warning: ignoring invalid --fps '{}'", args[i]); 30 }).clamp(1, 60);
-            }
-            "--port" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("Missing value for --port");
-                    break;
-                }
-                port = args[i].parse().unwrap_or_else(|_| { eprintln!("  Warning: ignoring invalid --port '{}'", args[i]); 8080 });
-            }
-            "--json" => json_output = true,
-            "-l" | "--list" => {
-                if json_output {
-                    println!("{}", server::list_windows_json());
-                } else {
-                    for w in server::list_windows() {
-                        println!("{:>5} | {} | {}", w.id, w.app, w.title);
-                    }
-                }
-                return;
-            }
-            "-h" | "--help" => {
-                eprintln!("mac-screen-cast — stream macOS screen to browser over LAN");
-                eprintln!();
-                eprintln!("USAGE");
-                eprintln!("  mac-screen-cast [FLAGS] [OPTIONS]");
-                eprintln!("  mac-screen-cast -l [--json]");
-                eprintln!("  mac-screen-cast -w <id> [--width px] [--fps N] [--port N]");
-                eprintln!();
-                eprintln!("FLAGS");
-                eprintln!("  -l, --list       List visible windows (human-readable)");
-                eprintln!("       --json      JSON output for --list (machine-parseable)");
-                eprintln!("  -h, --help       Show this help");
-                eprintln!();
-                eprintln!("OPTIONS");
-                eprintln!("  -w, --window-id  Window ID to capture                    [env: none]");
-                eprintln!("      --width      Max output width in pixels              [default: 1280]");
-                eprintln!("      --fps        Target frame rate (1-60)                [default: 30]");
-                eprintln!("      --port       HTTP server port                        [default: 8080]");
-                eprintln!();
-                eprintln!("EXAMPLES");
-                eprintln!("  mac-screen-cast -l --json              List windows as JSON");
-                eprintln!("  mac-screen-cast -w 12345 --width 720   Stream at 720p");
-                eprintln!("  mac-screen-cast -w 12345 --fps 60      Stream at 60 fps");
-                eprintln!();
-                eprintln!("HTTP API");
-                eprintln!("  GET  /         HTML player page");
-                eprintln!("  GET  /offer    WebRTC SDP offer");
-                eprintln!("  POST /signal   WebRTC answer + ICE candidates (JSON body)");
-                eprintln!("  GET  /latency  Current capture-to-send latency (ms)");
-                return;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
+HTTP API (at runtime):
+  GET  /         HTML player page
+  GET  /offer    WebRTC SDP offer
+  POST /signal   WebRTC answer + ICE candidates (JSON body)
+  GET  /latency  Current capture-to-send latency (ms)
+"
+)]
+struct Cli {
+    /// Window ID to capture (omit for interactive picker)
+    #[arg(short = 'w', long = "window-id")]
+    window_id: Option<u32>,
 
-    if wid == 0 {
-        let wins = server::list_windows();
-        if wins.is_empty() {
-            eprintln!("No windows found");
-            return;
-        }
-        let mut seen = std::collections::HashSet::new();
-        let mut uq = Vec::new();
-        for w in &wins {
-            if seen.insert((&w.app, &w.title)) {
-                uq.push(w);
-            }
-        }
-        for (j, w) in uq.iter().enumerate() {
-            println!(
-                "  [{:2}] {} - {}",
-                j + 1,
-                w.app,
-                if w.title.len() > 55 { &w.title[..55] } else { &w.title }
-            );
-        }
-        print!("Select window (1-{}): ", uq.len());
-        std::io::stdout().flush().ok();
-        let mut s = String::new();
-        std::io::stdin().read_line(&mut s).ok();
-        if let Ok(n) = s.trim().parse::<usize>() {
-            if n >= 1 && n <= uq.len() {
-                wid = uq[n - 1].id;
-                window_name = uq[n - 1].app.clone();
-            }
-        }
-        if wid == 0 {
-            return;
+    /// Max output width in pixels
+    #[arg(long, default_value_t = 1280)]
+    width: u32,
+
+    /// Target frame rate (1-60)
+    #[arg(long, default_value_t = 30)]
+    fps: u32,
+
+    /// HTTP server port
+    #[arg(long, default_value_t = 8080)]
+    port: u16,
+
+    /// List visible windows
+    #[arg(short, long)]
+    list: bool,
+
+    /// JSON output for --list
+    #[arg(long)]
+    json: bool,
+}
+
+// ── Shared state between threads ──
+
+struct SharedState {
+    stop: Arc<AtomicBool>,
+    ctrlc_count: Arc<AtomicBool>,
+    frame_count: Arc<AtomicU64>,
+    latest_latency: Arc<AtomicU64>,
+    wr_handle: Arc<RwLock<Option<webrtc::WebRtcHandle>>>,
+    wr_version: Arc<AtomicU64>,
+    wr_connected: Arc<AtomicBool>,
+    webrtc_rt: Arc<tokio::runtime::Runtime>,
+}
+
+impl SharedState {
+    fn new() -> Self {
+        let webrtc_rt = Arc::new(
+            tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime for WebRTC"),
+        );
+        SharedState {
+            stop: Arc::new(AtomicBool::new(false)),
+            ctrlc_count: Arc::new(AtomicBool::new(false)),
+            frame_count: Arc::new(AtomicU64::new(0)),
+            latest_latency: Arc::new(AtomicU64::new(0)),
+            wr_handle: Arc::new(RwLock::new(None)),
+            wr_version: Arc::new(AtomicU64::new(0)),
+            wr_connected: Arc::new(AtomicBool::new(false)),
+            webrtc_rt,
         }
     }
+}
 
-    // ── Initialize CoreGraphics (required for SCKit before macOS 26+?) ──
-    // The screencapturekit crate provides this FFI function to prevent
-    // CGS_REQUIRE_INIT assertion failures in command-line tools.
-    // SAFETY: sc_initialize_core_graphics() is an FFI function exported by
-    // the screencapturekit crate. It initializes CoreGraphics internals and
-    // must be called once before any SCStream usage in command-line tools.
-    unsafe { screencapturekit::ffi::sc_initialize_core_graphics() }
+// ── Capture setup: dimensions + SCContentFilter ──
 
-    // ── Compute output dimensions + build capture filter via SCShareableContent ──
-    let (out_w, out_h, capture_filter) = {
-        let content = SCShareableContent::get().unwrap_or_else(|e| {
-            eprintln!("ScreenCaptureKit error: {e}");
-            eprintln!(
-                "Grant Screen Recording permission in \
-                 System Settings > Privacy & Security > Screen Recording."
-            );
+struct CaptureSetup {
+    out_w: u32,
+    out_h: u32,
+    filter: SCContentFilter,
+}
+
+fn init_capture(wid: u32, max_w: u32) -> CaptureSetup {
+    let content = SCShareableContent::get().unwrap_or_else(|e| {
+        eprintln!("ScreenCaptureKit error: {e}");
+        eprintln!(
+            "Grant Screen Recording permission in \
+             System Settings > Privacy & Security > Screen Recording."
+        );
+        std::process::exit(1);
+    });
+    let windows = content.windows();
+    let window = windows
+        .iter()
+        .find(|w| w.window_id() == wid)
+        .unwrap_or_else(|| {
+            eprintln!("Window {wid} not found — try --list to see available windows.");
             std::process::exit(1);
         });
-        let windows = content.windows();
-        let window = windows
-            .iter()
-            .find(|w| w.window_id() == wid)
-            .unwrap_or_else(|| {
-                eprintln!("Window {wid} not found — try --list to see available windows.");
-                std::process::exit(1);
-            });
-        let frame = window.frame();
-        let nw = frame.size().width as u32;
-        let nh = frame.size().height as u32;
+    let frame = window.frame();
+    let nw = frame.size().width as u32;
+    let nh = frame.size().height as u32;
 
-        let (ow, oh) = if nw > max_w {
-            let rnh = (nh * max_w) / nw;
-            (max_w, rnh)
-        } else {
-            (nw, nh)
-        };
-
-        let filter = SCContentFilter::create().with_window(window).build();
-
-        (ow & !1, oh & !1, filter)
+    let (ow, oh) = if nw > max_w {
+        let rnh = (nh * max_w) / nw;
+        (max_w, rnh)
+    } else {
+        (nw, nh)
     };
 
-    eprintln!(
-        "  Capture {}x{} @ {}fps, output to :{}",
-        out_w, out_h, fps, port
-    );
+    let filter = SCContentFilter::create().with_window(window).build();
 
-    // ── Init H.264 encoder ──
-    let encoder = match h264::VtEncoder::new(out_w, out_h, fps) {
-        Ok(e) => Arc::new(e),
-        Err(e) => {
-            eprintln!("Encoder init failed: {e}");
-            return;
+    CaptureSetup {
+        out_w: ow & !1,
+        out_h: oh & !1,
+        filter,
+    }
+}
+
+// ── Interactive window picker ──
+
+fn select_window_interactively() -> (u32, String) {
+    let wins = server::list_windows();
+    if wins.is_empty() {
+        eprintln!("No windows found");
+        std::process::exit(1);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let uq: Vec<&server::Window> = wins
+        .iter()
+        .filter(|w| seen.insert((&w.app, &w.title)))
+        .collect();
+
+    for (j, w) in uq.iter().enumerate() {
+        println!(
+            "  [{:2}] {} - {}",
+            j + 1,
+            w.app,
+            if w.title.len() > 55 { &w.title[..55] } else { &w.title }
+        );
+    }
+    print!("Select window (1-{}): ", uq.len());
+    std::io::stdout().flush().ok();
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s).ok();
+
+    if let Ok(n) = s.trim().parse::<usize>() {
+        if n >= 1 && n <= uq.len() {
+            return (uq[n - 1].id, uq[n - 1].app.clone());
         }
-    };
-
-    // ── Channel: encoded frames (+ capture timestamp) → WebRTC sender ──
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<(h264::H264Frame, Instant)>(15);
-
-    // ── Channel: raw frames (capture → encoder thread, small buffer for low latency) ──
-    struct RawFrame {
-        sample: CMSampleBuffer,
-        seq: u64,
-        cap_time: Instant,
     }
-    let (raw_tx, raw_rx) = mpsc::sync_channel::<RawFrame>(4);
+    std::process::exit(0);
+}
 
-    // ── Stop flag ──
-    let stop = Arc::new(AtomicBool::new(false));
-    let ctrlc_count = Arc::new(AtomicBool::new(false));
-    {
-        let c_stop = stop.clone();
-        let c_count = ctrlc_count.clone();
-        ctrlc::set_handler(move || {
-            if c_count.swap(true, Ordering::Relaxed) {
-                eprintln!("\nForce exit");
-                std::process::exit(1);
-            }
-            eprintln!("\nStopping (Ctrl+C again to force)...");
-            c_stop.store(true, Ordering::Relaxed);
-        })
-        .ok();
+// ── Print window list and exit ──
+
+fn print_windows_and_exit(json: bool) {
+    if json {
+        println!("{}", server::list_windows_json());
+    } else {
+        for w in server::list_windows() {
+            println!("{:>5} | {} | {}", w.id, w.app, w.title);
+        }
     }
+    std::process::exit(0);
+}
 
-    // ── Encoder thread: decoupled from capture for pipeline parallelism ──
-    // Capture thread now only takes screenshots and pushes to raw_tx;
-    // encoding runs here in parallel so capture of frame N+1 overlaps
-    // with encoding of frame N.
+// ── Encoder thread: decoupled from capture for pipeline parallelism ──
+
+struct RawFrame {
+    sample: CMSampleBuffer,
+    seq: u64,
+    cap_time: Instant,
+}
+
+fn spawn_encoder_thread(
+    encoder: Arc<h264::VtEncoder>,
+    frame_tx: mpsc::SyncSender<(h264::H264Frame, Instant)>,
+    raw_rx: mpsc::Receiver<RawFrame>,
+    fps: u32,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    const ENCODE_ERROR_THROTTLE: Duration = Duration::from_secs(5);
     let encoder_timeout = Duration::from_millis((1000 / fps).max(16) as u64);
-    let encoder_thread = {
-        let encoder = encoder.clone();
-        let frame_tx = frame_tx.clone();
-        let stop_c = stop.clone();
-        thread::spawn(move || {
-            while !stop_c.load(Ordering::Relaxed) {
-                match raw_rx.recv_timeout(encoder_timeout) {
-                    Ok(raw) => {
-                        if let Some(pb) = raw.sample.image_buffer() {
-                            if let Some(surface) = pb.io_surface() {
-                                match encoder.encode(&surface, raw.seq, fps as i32) {
-                                    Ok(frame) => {
-                                        let _ = frame_tx.send((frame, raw.cap_time));
-                                    }
-                                    Err(e) => {
+    thread::spawn(move || {
+        let mut last_error_log = Instant::now();
+        while !stop.load(Ordering::Relaxed) {
+            match raw_rx.recv_timeout(encoder_timeout) {
+                Ok(raw) => {
+                    if let Some(pb) = raw.sample.image_buffer() {
+                        if let Some(surface) = pb.io_surface() {
+                            match encoder.encode(&surface, raw.seq, fps as i32) {
+                                Ok(frame) => {
+                                    let _ = frame_tx.send((frame, raw.cap_time));
+                                }
+                                Err(e) => {
+                                    let now = Instant::now();
+                                    if now - last_error_log >= ENCODE_ERROR_THROTTLE {
                                         eprintln!("\n  Encode error: {}", e);
+                                        last_error_log = now;
                                     }
                                 }
                             }
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-        })
-    };
+        }
+    })
+}
 
-    // ── Latency measurement ──
-    let latest_latency = Arc::new(AtomicU64::new(0));
+// ── Setup Ctrl+C handler ──
 
-    // ── WebRTC ──
-    let webrtc_rt = Arc::new(
-        tokio::runtime::Runtime::new().expect("create Tokio runtime for WebRTC"),
-    );
-    let wr_handle: Arc<RwLock<Option<webrtc::WebRtcHandle>>> = Arc::new(RwLock::new(None));
-    let wr_version = Arc::new(AtomicU64::new(0));
-    let srv_wr_conn = Arc::new(AtomicBool::new(false));
-    let srv_wr = wr_handle.clone();
-    let srv_wr_ver = wr_version.clone();
-    let srv_rt = webrtc_rt.clone();
-    let svr_s = stop.clone();
-    let srv_lat = latest_latency.clone();
+fn setup_ctrlc_handler(stop: Arc<AtomicBool>, ctrlc_count: Arc<AtomicBool>) {
+    ctrlc::set_handler(move || {
+        if ctrlc_count.swap(true, Ordering::Relaxed) {
+            eprintln!("\nForce exit");
+            std::process::exit(1);
+        }
+        eprintln!("\nStopping (Ctrl+C again to force)...");
+        stop.store(true, Ordering::Relaxed);
+    })
+    .ok();
+}
+
+// ── HTTP server thread ──
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_http_server(
+    port: u16,
+    fps: u32,
+    out_w: u32,
+    out_h: u32,
+    window_name: &str,
+    wr_handle: Arc<RwLock<Option<webrtc::WebRtcHandle>>>,
+    wr_version: Arc<AtomicU64>,
+    wr_connected: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    latest_latency: Arc<AtomicU64>,
+    webrtc_rt: Arc<tokio::runtime::Runtime>,
+) -> thread::JoinHandle<()> {
     let ip = server::get_ip();
+    let wn = window_name.to_string();
+
     eprintln!("  Initializing WebRTC...");
 
-    let srv = thread::spawn(move || {
-        use tiny_http::{Header, Response};
+    thread::spawn(move || {
+        use tiny_http::Response;
         let server = match tiny_http::Server::http(format!("0.0.0.0:{}", port)) {
             Ok(s) => s,
             Err(e) => {
@@ -311,9 +323,9 @@ fn main() {
                     let top = qr[(x, y)] != qrcode::Color::Light;
                     let bot = y + 1 < w && qr[(x, y + 1)] != qrcode::Color::Light;
                     out.push(match (top, bot) {
-                        (true,  true)  => '█',
-                        (true,  false) => '▀',
-                        (false, true)  => '▄',
+                        (true, true) => '█',
+                        (true, false) => '▀',
+                        (false, true) => '▄',
                         (false, false) => ' ',
                     });
                 }
@@ -324,8 +336,10 @@ fn main() {
             eprintln!("{}", out);
         }
 
+
+
         loop {
-            if svr_s.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) {
                 break;
             }
             let mut req = match server.recv_timeout(Duration::from_millis(500)) {
@@ -336,41 +350,28 @@ fn main() {
             let path = url.split('?').next().unwrap_or("/");
 
             let resp = match path {
-                "/" => Response::from_data(server::html(fps, &window_name).into_bytes())
-                    .with_header(
-                        "Content-Type: text/html; charset=utf-8"
-                            .parse::<Header>()
-                            .unwrap(),
-                    ),
+                "/" => Response::from_data(server::html(fps, &wn).into_bytes())
+                    .with_header(header_html()),
                 "/offer" => {
-                    // Refresh: close old PeerConnection, create new one
-                    let was_connected = srv_wr_conn.swap(false, Ordering::Relaxed);
+                    let was_connected = wr_connected.swap(false, Ordering::Relaxed);
                     if was_connected {
-                        // Clone the old handle out of the RwLock so we can
-                        // call close() (which blocks on Tokio) without holding
-                        // the lock. This avoids any risk of write-starvation.
-                        let old = rw_read(&srv_wr).clone();
+                        let old = rw_read(&wr_handle).clone();
                         if let Some(ref wr) = old {
                             wr.close();
                         }
-                        // Create replacement PeerConnection on the same runtime
                         if let Ok(new_handle) =
-                            webrtc::WebRtcHandle::new(srv_rt.handle().clone(), fps, out_w, out_h)
+                            webrtc::WebRtcHandle::new(webrtc_rt.handle().clone(), fps, out_w, out_h)
                         {
-                            *rw_write(&srv_wr) = Some(new_handle);
-                            srv_wr_ver.fetch_add(1, Ordering::Release);
+                            *rw_write(&wr_handle) = Some(new_handle);
+                            wr_version.fetch_add(1, Ordering::Release);
                             eprintln!("\n  WebRTC offer recreated for refresh");
                         } else {
                             eprintln!("\n  WebRTC recreate failed");
                         }
                     }
-                    match rw_read(&srv_wr).as_ref() {
+                    match rw_read(&wr_handle).as_ref() {
                         Some(wr) => Response::from_data(wr.offer.clone().into_bytes())
-                            .with_header(
-                                "Content-Type: application/sdp"
-                                    .parse::<Header>()
-                                    .unwrap(),
-                            ),
+                            .with_header(header_sdp()),
                         None => Response::from_data(Vec::from("not ready")).with_status_code(503),
                     }
                 }
@@ -378,7 +379,7 @@ fn main() {
                     let mut ok = false;
                     let mut body = String::new();
                     if req.as_reader().read_to_string(&mut body).is_ok() {
-                        if let Some(ref wr) = *rw_read(&srv_wr) {
+                        if let Some(ref wr) = *rw_read(&wr_handle) {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                                 if let Some(sdp) = v["sdp"].as_str() {
                                     if wr.set_answer(sdp.to_string()).is_ok() {
@@ -390,7 +391,7 @@ fn main() {
                                                 }
                                             }
                                         }
-                                        srv_wr_conn.store(true, Ordering::Relaxed);
+                                        wr_connected.store(true, Ordering::Relaxed);
                                         eprintln!("\n  Signal exchange complete");
                                         ok = true;
                                     }
@@ -405,69 +406,50 @@ fn main() {
                     };
                     Response::from_data(Vec::from(body))
                         .with_status_code(status)
-                        .with_header("Content-Type: application/json".parse::<Header>().unwrap())
+                        .with_header(header_json())
                 }
                 "/latency" => {
-                    let ms = srv_lat.load(Ordering::Relaxed);
+                    let ms = latest_latency.load(Ordering::Relaxed);
                     Response::from_data(format!("{}", ms).into_bytes())
-                        .with_header("Content-Type: text/plain".parse::<Header>().unwrap())
+                        .with_header(header_text())
                 }
                 _ => Response::from_data(Vec::from("{\"error\":\"not found\"}"))
                     .with_status_code(404)
-                    .with_header("Content-Type: application/json".parse::<Header>().unwrap()),
+                    .with_header(header_json()),
             };
             req.respond(resp).ok();
         }
-    });
+    })
+}
 
-    // ── Init WebRTC (blocks ~3s for ICE gathering) ──
-    {
-        match webrtc::WebRtcHandle::new(webrtc_rt.handle().clone(), fps, out_w, out_h) {
-            Ok(handle) => {
-                eprintln!("  WebRTC offer ready");
-                *rw_write(&wr_handle) = Some(handle);
-                wr_version.fetch_add(1, Ordering::Release);
-            }
-            Err(e) => eprintln!("  WebRTC init failed: {}", e),
-        }
-    }
+// ── Main pipeline: receive encoded frames → WebRTC ──
 
-    // ── Start ScreenCaptureKit capture ──
-    let raw_tx_cb = raw_tx.clone();
-    let stop_for_cap = stop.clone();
-    let frame_count = Arc::new(AtomicU64::new(0));
-    let frame_count_cb = frame_count.clone();
+#[allow(clippy::too_many_arguments)]
+fn run_pipeline(
+    frame_rx: mpsc::Receiver<(h264::H264Frame, Instant)>,
+    stop: Arc<AtomicBool>,
+    frame_count: Arc<AtomicU64>,
+    latest_latency: Arc<AtomicU64>,
+    wr_handle: Arc<RwLock<Option<webrtc::WebRtcHandle>>>,
+    wr_version: Arc<AtomicU64>,
+    webrtc_rt: Arc<tokio::runtime::Runtime>,
+    capture_session: &mut capture::CaptureSession,
+    encoder_thread: thread::JoinHandle<()>,
+    http_thread: thread::JoinHandle<()>,
+) {
 
-    let mut capture_session = capture::CaptureSession::new(
-        capture_filter,
-        out_w,
-        out_h,
-        fps,
-        move |sample: CMSampleBuffer, _type: SCStreamOutputType| {
-            let seq = frame_count_cb.fetch_add(1, Ordering::Relaxed);
-            if raw_tx_cb.send(RawFrame { sample, seq, cap_time: Instant::now() }).is_err() {
-                eprintln!("\n  Encoder thread disconnected — stopping capture");
-                stop_for_cap.store(true, Ordering::Relaxed);
-            }
-        },
-    );
-
-    // ── Main loop: receive encoded frames → WebRTC ──
     let mut send_count: u64 = 0;
     let mut last_stats = Instant::now();
     let mut last_send = Instant::now();
     let mut prev_cap: u64 = 0;
     let mut prev_send: u64 = 0;
 
-    // Cache the WebRTC handle to avoid locking every frame.
-    // Re-clone when HTTP thread refreshes (page reload).
     let mut wr_cached: Option<webrtc::WebRtcHandle> = rw_read(&wr_handle).clone();
     let mut wr_ver = wr_version.load(Ordering::Acquire);
 
     while !stop.load(Ordering::Relaxed) {
         match frame_rx.recv_timeout(Duration::from_millis(100)) {
             Ok((frame, cap_time)) => {
-                // Re-read handle if HTTP thread replaced it on refresh
                 let v = wr_version.load(Ordering::Acquire);
                 if v != wr_ver {
                     wr_cached = rw_read(&wr_handle).clone();
@@ -485,7 +467,6 @@ fn main() {
 
                 latest_latency.store(cap_time.elapsed().as_millis() as u64, Ordering::Relaxed);
 
-                // Per-second stats
                 let elapsed = last_stats.elapsed();
                 if elapsed >= Duration::from_secs(1) {
                     let cap_total = frame_count.load(Ordering::Relaxed);
@@ -516,12 +497,149 @@ fn main() {
         }
     }
 
-    // Cleanup (order: capture → encoder → server → runtime)
     capture_session.stop();
     encoder_thread.join().ok();
-    srv.join().ok();
-    // Explicitly drop the runtime to shut down all spawned WebRTC tasks
-    // before the process exits. The runtime Arc is still held by webrtc_rt
-    // on this stack frame (srv_rt inside the server thread was dropped on join).
-    drop(webrtc_rt);
+    http_thread.join().ok();
+
+    let _ = webrtc_rt;
+}
+
+fn main() {
+    update_checker::check();
+
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::ring::default_provider(),
+    );
+
+    let cli = Cli::parse();
+
+    // --list: print windows and exit
+    if cli.list {
+        print_windows_and_exit(cli.json);
+    }
+
+    // Resolve window ID: CLI arg or interactive picker
+    let (wid, window_name) = match cli.window_id {
+        Some(id) if id > 0 => (id, String::from("mac-screen-cast")),
+        _ => select_window_interactively(),
+    };
+
+    // ── Initialize CoreGraphics ──
+    // SAFETY: sc_initialize_core_graphics() is an FFI function exported by
+    // the screencapturekit crate. It initializes CoreGraphics internals and
+    // must be called once before any SCStream usage in command-line tools.
+    unsafe { screencapturekit::ffi::sc_initialize_core_graphics() }
+
+    // ── Compute output dimensions + build capture filter ──
+    let CaptureSetup {
+        out_w,
+        out_h,
+        filter,
+    } = init_capture(wid, cli.width);
+
+    eprintln!(
+        "  Capture {}x{} @ {}fps, output to :{}",
+        out_w, out_h, cli.fps, cli.port
+    );
+
+    // ── Init H.264 encoder ──
+    let encoder = Arc::new(
+        h264::VtEncoder::new(out_w, out_h, cli.fps)
+            .unwrap_or_else(|e| { eprintln!("Encoder init failed: {e}"); std::process::exit(1); }),
+    );
+
+    // ── Channels ──
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<(h264::H264Frame, Instant)>(15);
+    let (raw_tx, raw_rx) = mpsc::sync_channel::<RawFrame>(4);
+
+    // ── Shared state ──
+    let state = SharedState::new();
+    let stop = state.stop.clone();
+    let ctrlc_count = state.ctrlc_count.clone();
+    let frame_count = state.frame_count.clone();
+    let latest_latency = state.latest_latency.clone();
+    let wr_handle = state.wr_handle.clone();
+    let wr_version = state.wr_version.clone();
+    let wr_connected = state.wr_connected.clone();
+    let webrtc_rt = state.webrtc_rt.clone();
+
+    // ── Ctrl+C handler ──
+    setup_ctrlc_handler(stop.clone(), ctrlc_count);
+
+    // ── Encoder thread ──
+    let encoder_thread = spawn_encoder_thread(
+        encoder,
+        frame_tx,
+        raw_rx,
+        cli.fps,
+        state.stop.clone(),
+    );
+
+    // ── HTTP server ──
+    let http_thread = spawn_http_server(
+        cli.port,
+        cli.fps,
+        out_w,
+        out_h,
+        &window_name,
+        wr_handle.clone(),
+        wr_version.clone(),
+        wr_connected.clone(),
+        stop.clone(),
+        latest_latency.clone(),
+        webrtc_rt.clone(),
+    );
+
+    // ── Init WebRTC (blocks ~3s for ICE gathering) ──
+    {
+        let rt_handle = webrtc_rt.handle().clone();
+        match webrtc::WebRtcHandle::new(rt_handle, cli.fps, out_w, out_h) {
+            Ok(handle) => {
+                eprintln!("  WebRTC offer ready");
+                *rw_write(&wr_handle) = Some(handle);
+                wr_version.fetch_add(1, Ordering::Release);
+            }
+            Err(e) => eprintln!("  WebRTC init failed: {}", e),
+        }
+    }
+
+    // ── Start ScreenCaptureKit capture ──
+    let raw_tx_cb = raw_tx.clone();
+    let stop_for_cap = stop.clone();
+    let frame_count_cb = frame_count.clone();
+
+    let mut capture_session = capture::CaptureSession::new(
+        filter,
+        out_w,
+        out_h,
+        cli.fps,
+        move |sample: CMSampleBuffer, _type: SCStreamOutputType| {
+            let seq = frame_count_cb.fetch_add(1, Ordering::Relaxed);
+            if raw_tx_cb
+                .send(RawFrame {
+                    sample,
+                    seq,
+                    cap_time: Instant::now(),
+                })
+                .is_err()
+            {
+                eprintln!("\n  Encoder thread disconnected — stopping capture");
+                stop_for_cap.store(true, Ordering::Relaxed);
+            }
+        },
+    );
+
+    // ── Main pipeline ──
+    run_pipeline(
+        frame_rx,
+        stop,
+        frame_count,
+        latest_latency,
+        wr_handle,
+        wr_version,
+        webrtc_rt,
+        &mut capture_session,
+        encoder_thread,
+        http_thread,
+    );
 }
