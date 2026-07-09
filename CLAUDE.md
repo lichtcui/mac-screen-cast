@@ -85,6 +85,27 @@ Runs on startup in a background thread. Caches the latest GitHub release tag in 
 | `webrtc` | `src/webrtc.rs` | PeerConnection setup, FU-A RTP packetization, track management |
 | `update_checker` | `src/update_checker.rs` | Version check against GitHub releases (background thread, 10s timeout, 24h cache) |
 
+## Demo Video (README)
+
+A split-screen animated WebP (`docs/demo.webp`) shows the CLI + browser stream workflow.
+
+### Update the demo
+
+1. Record a new screen capture:
+   - Arrange: **terminal left half** | **browser right half** (macOS window-snap)
+   - QuickTime Player → File → New Screen Recording
+   - Record the full flow: run `mac-screen-cast` → select window → open browser URL
+2. Run the helper script:
+   ```bash
+   TRIM_START=0.5 TRIM_END=9 ./scripts/make-demo.sh sample.mov
+   ```
+   The script auto-detects the best encoder path:
+   - `libwebp_anim` (ffmpeg built-in)
+   - `img2webp` (libwebp tools, fallback)
+   - GIF (last resort)
+3. Embed in README (already done via `<img src="docs/demo.webp" ...>`)
+4. Commit `docs/demo.webp` and any script changes.
+
 ## Gotchas
 
 - **Double-tap Ctrl+C force-exit**: second Ctrl+C calls `std::process::exit(1)` — useful if the first Ctrl+C doesn't shut down cleanly (e.g. WebRTC hang)
