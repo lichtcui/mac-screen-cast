@@ -6,6 +6,10 @@
 
 Stream macOS screen to browser over LAN. Uses ScreenCaptureKit for zero-copy capture, VideoToolbox for hardware H.264 encoding, and WebRTC for low-latency delivery.
 
+## Demo
+
+<img src="docs/demo.webp" alt="mac-screen-cast demo: CLI → browser streaming" width="100%">
+
 ## Requirements
 
 - **macOS 12.3+** — ScreenCaptureKit availability
