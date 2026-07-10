@@ -6,9 +6,12 @@ use std::time::{Duration, Instant};
 
 use screencapturekit::prelude::*;
 
-use crate::capture::{FrameBuffer, FrameBufferHandle, ScreenCapture};
+use crate::capture::{FrameBuffer, ScreenCapture};
 #[cfg(target_os = "macos")]
 use crate::capture::macos::MacosCapture;
+#[cfg(target_os = "macos")]
+use crate::encoder::macos::MacosEncoder;
+use crate::encoder::HardwareEncoder;
 use crate::h264;
 use crate::server;
 use crate::webrtc;
@@ -53,10 +56,10 @@ pub struct PipelineConfig {
 }
 
 /// Spawn a background thread that pulls `FrameBuffer`s from `frame_rx`,
-/// encodes them with the given hardware encoder, and forwards the resulting
+/// encodes them with the given `HardwareEncoder`, and forwards the resulting
 /// `H264Frame` through `frame_tx`.
 fn spawn_encoder_thread(
-    encoder: Arc<h264::VtEncoder>,
+    encoder: Arc<dyn HardwareEncoder<Options = ()> + Send + Sync>,
     frame_tx: mpsc::SyncSender<(h264::H264Frame, Instant)>,
     frame_rx: mpsc::Receiver<FrameBuffer>,
     fps: u32,
@@ -70,17 +73,21 @@ fn spawn_encoder_thread(
             match frame_rx.recv_timeout(encoder_timeout) {
                 Ok(fb) => {
                     let cap_time = fb.cap_time;
-                    if let FrameBufferHandle::IOSurface(ref surface) = fb.handle {
-                        match encoder.encode(surface, fb.pts, fps as i32) {
-                            Ok(frame) => {
-                                let _ = frame_tx.send((frame, cap_time));
-                            }
-                            Err(e) => {
-                                let now = Instant::now();
-                                if now - last_error_log >= ENCODE_ERROR_THROTTLE {
-                                    eprintln!("\n  Encode error: {}", e);
-                                    last_error_log = now;
-                                }
+                    match encoder.encode(&fb) {
+                        Ok(ef) => {
+                            let frame = h264::H264Frame {
+                                data: ef.data,
+                                is_keyframe: ef.is_keyframe,
+                                sps: ef.sps,
+                                pps: ef.pps,
+                            };
+                            let _ = frame_tx.send((frame, cap_time));
+                        }
+                        Err(e) => {
+                            let now = Instant::now();
+                            if now - last_error_log >= ENCODE_ERROR_THROTTLE {
+                                eprintln!("\n  Encode error: {}", e);
+                                last_error_log = now;
                             }
                         }
                     }
@@ -200,11 +207,11 @@ pub fn run_macos_pipeline(filter: SCContentFilter, config: PipelineConfig) {
         window_name,
     } = config;
 
-    // ── Init H.264 encoder ──
+    // ── Init H.264 encoder (via HardwareEncoder trait) ──
     let encoder = Arc::new(
-        h264::VtEncoder::new(out_w, out_h, fps)
+        MacosEncoder::new(out_w, out_h, fps, ())
             .unwrap_or_else(|e| { eprintln!("Encoder init failed: {e}"); std::process::exit(1); }),
-    );
+    ) as Arc<dyn HardwareEncoder<Options = ()> + Send + Sync>;
 
     // ── Channels ──
     let (frame_tx, frame_rx) = mpsc::sync_channel::<(h264::H264Frame, Instant)>(15);

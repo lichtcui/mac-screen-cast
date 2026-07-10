@@ -25,7 +25,7 @@ pub struct EncodedFrame {
 }
 
 /// Each platform provides a hardware-accelerated H.264 encoder.
-pub trait HardwareEncoder: Send {
+pub trait HardwareEncoder: Send + Sync {
     type Options;
 
     /// Create a new encoder session for the given resolution and frame rate.

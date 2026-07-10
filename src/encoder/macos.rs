@@ -9,6 +9,10 @@ pub struct MacosEncoder {
     fps: u32,
 }
 
+// SAFETY: VtEncoder already has unsafe impl Sync; MacosEncoder wraps it without adding
+// any shared mutable state.
+unsafe impl Sync for MacosEncoder {}
+
 impl HardwareEncoder for MacosEncoder {
     type Options = ();
 
