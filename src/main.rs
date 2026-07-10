@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use screencapturekit::prelude::*;
 
+use capture::{FrameBuffer, FrameBufferHandle, ScreenCapture};
+
 
 // ── CLI argument parsing via clap derive ──
 
@@ -186,16 +188,10 @@ fn print_windows_and_exit(json: bool) {
 
 // ── Encoder thread: decoupled from capture for pipeline parallelism ──
 
-struct RawFrame {
-    sample: CMSampleBuffer,
-    seq: u64,
-    cap_time: Instant,
-}
-
 fn spawn_encoder_thread(
     encoder: Arc<h264::VtEncoder>,
     frame_tx: mpsc::SyncSender<(h264::H264Frame, Instant)>,
-    raw_rx: mpsc::Receiver<RawFrame>,
+    frame_rx: mpsc::Receiver<FrameBuffer>,
     fps: u32,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
@@ -204,20 +200,19 @@ fn spawn_encoder_thread(
     thread::spawn(move || {
         let mut last_error_log = Instant::now();
         while !stop.load(Ordering::Relaxed) {
-            match raw_rx.recv_timeout(encoder_timeout) {
-                Ok(raw) => {
-                    if let Some(pb) = raw.sample.image_buffer() {
-                        if let Some(surface) = pb.io_surface() {
-                            match encoder.encode(&surface, raw.seq, fps as i32) {
-                                Ok(frame) => {
-                                    let _ = frame_tx.send((frame, raw.cap_time));
-                                }
-                                Err(e) => {
-                                    let now = Instant::now();
-                                    if now - last_error_log >= ENCODE_ERROR_THROTTLE {
-                                        eprintln!("\n  Encode error: {}", e);
-                                        last_error_log = now;
-                                    }
+            match frame_rx.recv_timeout(encoder_timeout) {
+                Ok(fb) => {
+                    let cap_time = fb.cap_time;
+                    if let FrameBufferHandle::IOSurface(ref surface) = fb.handle {
+                        match encoder.encode(surface, fb.pts, fps as i32) {
+                            Ok(frame) => {
+                                let _ = frame_tx.send((frame, cap_time));
+                            }
+                            Err(e) => {
+                                let now = Instant::now();
+                                if now - last_error_log >= ENCODE_ERROR_THROTTLE {
+                                    eprintln!("\n  Encode error: {}", e);
+                                    last_error_log = now;
                                 }
                             }
                         }
@@ -255,7 +250,7 @@ fn run_pipeline(
     wr_handle: Arc<RwLock<Option<webrtc::WebRtcHandle>>>,
     wr_version: Arc<AtomicU64>,
     webrtc_rt: Arc<tokio::runtime::Runtime>,
-    capture_session: &mut capture::CaptureSession,
+    capture_session: &mut impl ScreenCapture,
     encoder_thread: thread::JoinHandle<()>,
     http_thread: thread::JoinHandle<()>,
 ) {
@@ -319,7 +314,7 @@ fn run_pipeline(
         }
     }
 
-    capture_session.stop();
+    let _ = capture_session.stop();
     encoder_thread.join().ok();
     http_thread.join().ok();
 
@@ -372,7 +367,7 @@ fn main() {
 
     // ── Channels ──
     let (frame_tx, frame_rx) = mpsc::sync_channel::<(h264::H264Frame, Instant)>(15);
-    let (raw_tx, raw_rx) = mpsc::sync_channel::<RawFrame>(4);
+    let (cap_tx, cap_rx) = mpsc::sync_channel::<FrameBuffer>(4);
 
     // ── Shared state ──
     let state = SharedState::new();
@@ -392,7 +387,7 @@ fn main() {
     let encoder_thread = spawn_encoder_thread(
         encoder,
         frame_tx,
-        raw_rx,
+        cap_rx,
         cli.fps,
         state.stop.clone(),
     );
@@ -426,30 +421,23 @@ fn main() {
     }
 
     // ── Start ScreenCaptureKit capture ──
-    let raw_tx_cb = raw_tx.clone();
+    let cap_tx_cb = cap_tx.clone();
     let stop_for_cap = stop.clone();
-    let frame_count_cb = frame_count.clone();
 
-    let mut capture_session = capture::CaptureSession::new(
-        filter,
-        out_w,
-        out_h,
-        cli.fps,
-        move |sample: CMSampleBuffer, _type: SCStreamOutputType| {
-            let seq = frame_count_cb.fetch_add(1, Ordering::Relaxed);
-            if raw_tx_cb
-                .send(RawFrame {
-                    sample,
-                    seq,
-                    cap_time: Instant::now(),
-                })
-                .is_err()
-            {
-                eprintln!("\n  Encoder thread disconnected — stopping capture");
-                stop_for_cap.store(true, Ordering::Relaxed);
-            }
-        },
-    );
+    let mut capture_session = capture::macos::MacosCapture::create((
+        filter, out_w, out_h, cli.fps,
+    ))
+    .unwrap_or_else(|e| {
+        eprintln!("Capture init failed: {e}");
+        std::process::exit(1);
+    });
+
+    let _ = capture_session.start(move |fb: FrameBuffer| {
+        if cap_tx_cb.send(fb).is_err() {
+            eprintln!("\n  Encoder thread disconnected — stopping capture");
+            stop_for_cap.store(true, Ordering::Relaxed);
+        }
+    });
 
     // ── Main pipeline ──
     run_pipeline(

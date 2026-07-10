@@ -4,10 +4,6 @@ use std::time::Instant;
 /// Convenience alias for fallible capture operations.
 pub type CaptureResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-// ── Re-export from legacy module (will be absorbed into macos.rs in Task 3) ──
-pub mod old;
-pub use old::CaptureSession;
-
 // ── Platform frame buffer ──
 
 /// 不透明的平台帧缓冲区，零拷贝传给编码器
@@ -74,6 +70,6 @@ pub trait ScreenCapture: Send {
 // ── Platform module stubs (will be filled in subsequent tasks) ──
 
 #[cfg(target_os = "macos")]
-mod macos;
+pub mod macos;
 #[cfg(target_os = "linux")]
 mod linux;
