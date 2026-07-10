@@ -189,11 +189,11 @@ Client                                      xdg-desktop-portal
   │  ← Signal: PipeWire stream node info (FD + ID) │
 ```
 
-**Rust D-Bus 包选择**：`zbus` 4.x（纯 Rust，异步，tokio 兼容）。
+**Rust D-Bus 包选择**：`zbus` 5.x（纯 Rust，异步，tokio 兼容，62M+ 下载量，716 GitHub stars，周更）。
 
 **重要：需启用 `tokio` feature**：
 ```toml
-zbus = { version = "4", default-features = false, features = ["tokio"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 ```
 
 ### D-Bus / PipeWire 异步桥接
@@ -237,7 +237,9 @@ pw_init() → pw_main_loop → pw_context → pw_core (连接)
       spa_data[0].type == SPA_DATA_DmaBuf → fd, modifier, stride
 ```
 
-**包选择**：`pipewire-rs`（社区维护，覆盖 sys 绑定 + 高层 API）。
+**包选择**：`pipewire` crate（官方 PipeWire Rust 绑定，v0.10，1M+ 下载量，活跃维护）。
+
+注意 crates.io 上的名字是 `pipewire` 而非 `pipewire-rs`。仓库位于 https://gitlab.freedesktop.org/pipewire/pipewire-rs 。
 
 ### VAAPI 编码
 
@@ -439,8 +441,8 @@ apple-cf = { version = "0.9", default-features = false, features = ["iosurface"]
 
 # ── Linux ──
 [target.'cfg(target_os = "linux")'.dependencies]
-pipewire = "0.9"
-zbus = { version = "4", default-features = false, features = ["tokio"] }
+pipewire = "0.10"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 drm-fourcc = "2"
 x11rb = { version = "0.13", features = ["shm", "composite"] }
 libc = "0.2"
