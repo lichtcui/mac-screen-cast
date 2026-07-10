@@ -72,4 +72,4 @@ pub trait ScreenCapture: Send {
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "linux")]
-mod linux;
+pub mod linux;
