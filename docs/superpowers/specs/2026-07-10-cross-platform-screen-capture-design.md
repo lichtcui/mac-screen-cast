@@ -450,12 +450,12 @@ libc = "0.2"
 
 # ── Windows ──
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.58", features = [
-    "Graphics_DirectX_Direct3D11",
-    "Graphics_Dxgi",
+windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Direct3D11",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
 ] }
 ```
 
