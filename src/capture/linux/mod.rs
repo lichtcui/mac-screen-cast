@@ -1,43 +1,68 @@
 //! Linux screen capture — Wayland (PipeWire) primary, X11 fallback.
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
 
-use super::{CaptureResult, FrameBuffer, FrameBufferHandle, ScreenCapture};
+use super::{CaptureResult, FrameBuffer, ScreenCapture};
 
 mod portal;
 mod pipewire;
 
-/// Linux 屏幕捕获实现
+/// Linux screen capture implementation.
 ///
-/// 自动检测运行环境：
-/// - WAYLAND_DISPLAY 已设置 → Wayland (PipeWire) 路径
-/// - 仅 DISPLAY 已设置 → X11 fallback 路径（后续实现）
-pub struct LinuxCapture;
+/// Auto-detects the display server:
+/// - `WAYLAND_DISPLAY` set → Wayland (PipeWire via xdg-desktop-portal)
+/// - Only `DISPLAY` set → X11 fallback (via XComposite + XShm, future)
+pub struct LinuxCapture {
+    width: u32,
+    height: u32,
+    fps: u32,
+    worker_thread: Option<thread::JoinHandle<()>>,
+    stop_flag: Arc<AtomicBool>,
+}
 
 impl ScreenCapture for LinuxCapture {
-    type Options = (u32, u32, u32); // (window_id, width, height)
+    type Options = (u32, u32, u32); // (width, height, fps)
 
-    fn create(_options: Self::Options) -> CaptureResult<Self> {
-        // 检测运行环境
+    fn create(options: Self::Options) -> CaptureResult<Self> {
         let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
         if !is_wayland {
-            // X11 fallback — 暂未实现，返回错误
+            let has_display = std::env::var("DISPLAY").is_ok();
+            if !has_display {
+                return Err("Neither WAYLAND_DISPLAY nor DISPLAY set — no display server detected".into());
+            }
             return Err("X11 capture not yet implemented; run under Wayland".into());
         }
-        Ok(LinuxCapture)
+        Ok(LinuxCapture {
+            width: options.0,
+            height: options.1,
+            fps: options.2,
+            worker_thread: None,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     fn start<F>(&mut self, _on_frame: F) -> CaptureResult<()>
     where
         F: FnMut(FrameBuffer) + Send + 'static,
     {
-        // 需要在 tokio 运行时中异步执行 Portal → PipeWire 流程
-        // 完整实现需要 Linux 环境测试
-        Err("Linux capture not yet fully implemented".into())
+        // Full implementation requires:
+        //   1. Tokio runtime → zbus Portal D-Bus session
+        //   2. PipeWire main-loop thread → DMA-BUF fd extraction
+        //   3. Channel bridge between Portal and PipeWire threads
+        //
+        // This requires a running Wayland + PipeWire environment to test.
+        // Placeholder returns a clear error until the full integration
+        // is wired on an actual Linux machine.
+        Err("Linux capture start not yet implemented — needs PipeWire + Portal runtime".into())
     }
 
     fn stop(&mut self) -> CaptureResult<()> {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        if let Some(h) = self.worker_thread.take() {
+            let _ = h.join();
+        }
         Ok(())
     }
 }
