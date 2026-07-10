@@ -27,13 +27,24 @@ serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
 rustrtc = "0.3"
 rustls = { version = "0.23", features = ["ring"] }
+qrcode = "0.14"
+ureq = "2"
+static_assertions = "1"
+
+# ── macOS ──
+[target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = { version = "8", features = ["macos_14_0"] }
 videotoolbox = "0.18"
 apple-cf = { version = "0.9", default-features = false, features = ["iosurface"] }
-qrcode = "0.14"
-ureq = "2"
 spin_sleep = "1"
-static_assertions = "1"
+
+# ── Linux ──
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = "0.10"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+drm-fourcc = "2"
+x11rb = { version = "0.13", features = ["shm", "composite"] }
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
