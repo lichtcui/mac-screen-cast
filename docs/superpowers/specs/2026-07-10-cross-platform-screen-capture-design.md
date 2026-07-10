@@ -29,22 +29,40 @@ Windows: DXGI DDA ──shared handle──→ NVENC/AMF ──H.264──→ We
 ```rust
 /// 不透明的平台帧缓冲区句柄，零拷贝传给编码器
 pub struct FrameBuffer {
-    /// 平台特定的 GPU 资源句柄
+    /// 平台特定的 GPU/CPU 资源句柄
     pub handle: FrameBufferHandle,
     pub width: u32,
     pub height: u32,
     pub pts: u64,        // 递增的时间戳
     pub timescale: u32,  // pts 的时间基准（通常 1000 或 fps）
+    pub cap_time: std::time::Instant, // 捕获时间戳，用于延迟追踪
 }
 
 pub enum FrameBufferHandle {
+    /// macOS: IOSurface 引用（已 retain），Drop 时 CFRelease
     #[cfg(target_os = "macos")]
-    IOSurface(crate::ffi::IOSurfaceRef),
+    IOSurface(IoSurfaceRef),
+    /// Linux (Wayland): DMA-BUF fd，OwnedFd 自动 close
     #[cfg(target_os = "linux")]
     DmaBuf { fd: std::os::fd::OwnedFd, modifier: u64, drm_format: u32 },
+    /// Linux (X11 fallback): CPU 端共享内存，需上传到 GPU
+    #[cfg(target_os = "linux")]
+    CpuBuffer { ptr: *mut u8, size: usize, fd: std::os::fd::OwnedFd },
+    /// Windows: D3D11 Texture2D COM 接口，Drop 时自动 Release
     #[cfg(target_os = "windows")]
-    D3D11Texture { texture: *mut c_void, keyed_mutex: *mut c_void },
+    D3D11Texture(windows::Graphics::DirectX::Direct3D11::ID3D11Texture2D),
 }
+
+// 注：FrameBuffer 通过 channel 跨线程发送，需要 unsafe impl Send
+// 每平台的 Drop 实现负责释放 GPU/CPU 资源
+//
+// 安全理由（unsafe impl Send）：
+// - IOSurfaceRef: CF 对象，线程安全
+// - DmaBuf fd: OwnedFd 是 Send
+// - CpuBuffer ptr: 只在编码线程使用，不跨线程
+// - ID3D11Texture2D: COM 接口是线程安全的
+//
+// 每个平台需要分别 #[cfg] 包裹 unsafe impl Send for FrameBuffer
 
 /// 每个平台需要提供的能力
 #[async_trait]
@@ -171,7 +189,43 @@ Client                                      xdg-desktop-portal
   │  ← Signal: PipeWire stream node info (FD + ID) │
 ```
 
-**Rust D-Bus 包选择**：`zbus` 3.x（纯 Rust，异步，tokio 兼容）。
+**Rust D-Bus 包选择**：`zbus` 4.x（纯 Rust，异步，tokio 兼容）。
+
+**重要：需启用 `tokio` feature**：
+```toml
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+```
+
+### D-Bus / PipeWire 异步桥接
+
+`zbus` 使用 tokio 异步运行时，而 PipeWire 使用自己的主循环回调模型。
+
+**方案：专用线程 + mpsc 通道（推荐）**
+
+```
+[D-Bus thread (zbus/tokio)]              [PipeWire thread]
+     │                                          │
+     │  Portal Start()                          │ pw_main_loop_run()
+     │  → 获取 PipeWire node ID + FD            │
+     │  → 通过 Arc<Mutex<>> 传给 PipeWire 线程   │
+     │─────────────────────────────────────────→│
+     │                                          │ on_process() →
+     │                                    mpsc  │ FrameBuffer(DmaBuf fd)
+     │                                          ▼
+     │                              [Encoder thread]
+     │                              VAAPI::encode(&frame)
+```
+
+流程：
+1. D-Bus 线程通过 `zbus` 调用 Portal API，获取 PipeWire node ID 和 FD
+2. 通过 `Arc<Mutex<Option<...>>>` 共享给 PipeWire 线程
+3. PipeWire 线程运行 `pw_main_loop_run()`，`on_process` 回调提取 DMA-BUF fd
+4. 回调中构造 `FrameBuffer::DmaBuf` 并通过 `mpsc::Sender` 发送给编码器线程
+5. 这完全匹配现有 pipeline 的 capture_thread → mpsc → encoder_thread 模式
+
+此方案零改动现有 pipeline，纯新增一个线程 + 通道。
+
+---
 
 ### PipeWire 流接收
 
@@ -187,23 +241,59 @@ pw_init() → pw_main_loop → pw_context → pw_core (连接)
 
 ### VAAPI 编码
 
+**DMA-BUF 导入方向**：PipeWire 产出的 DMA-BUF fd 需要 **导入** 为 VA surface，而非导出。
+
 ```
-vaDisplay = vaGetDisplayDRM(drm_fd)  // 或 vaGetDisplay (X11)
+vaDisplay = vaGetDisplayDRM(drm_fd)
   → vaInitialize()
   → vaCreateConfig(VAProfileH264High, VAEntrypointEncSlice, ...)
-  → vaCreateContext()
+  → vaCreateContext(num_surfaces=4)   // ping-pong buffer pool
 
-对于每帧：
-  → vaCreateSurfaces(VA_RT_FORMAT_YUV420, w, h)
-  → vaPutSurface (走 DMA-BUF 导入：VASurfaceAttribExternalBuffers)
-     或 vaExportSurfaceHandle(DMA_BUF) — 依赖 libva 版本
+对于每帧（PipeWire on_process 回调中的 DMA-BUF fd）：
+  → vaCreateSurfaces + VASurfaceAttribExternalBuffers
+     将 DMA-BUF fd 直接导入为 VA surface（零拷贝）
   → vaBeginPicture() → vaRenderPicture() → vaEndPicture()
   → vaSyncSurface() → vaGetEncodedBits() → 输出 H.264 NALs
 ```
 
+`VASurfaceAttribExternalBuffers` 使用示例（概念代码）：
+```c
+VASurfaceAttribExternalBuffers attr = {0};
+attr.pixel_format = VA_FOURCC_NV12;
+attr.width = width;
+attr.height = height;
+attr.data_size = stride * height;
+attr.num_planes = 2;
+attr.buffers = &dma_buf_fd;
+attr.num_buffers = 1;
+attr.flags = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+
+VASurfaceAttrib attrib;
+attrib.type = VASurfaceAttribExternalBuffers;
+attrib.value.type = VAGenericValueTypePointer;
+attrib.value.value.p = &attr;
+
+vaCreateSurfaces(va_dpy, VA_RT_FORMAT_YUV420, width, height,
+                 &surface, 1, &attrib, 1);
+```
+
+**版本要求**：
+- libva ≥ 2.6 — `VASurfaceAttribExternalBuffers` 可用
+- Mesa VAAPI driver ≥ 21.0 — AMD 稳定 DMA-BUF 导入
+- intel-media-driver ≥ 20.0 — Intel 稳定
+- Kernel Linux ≥ 5.4
+
+**Intel vs AMD 差异**：
+| 方面 | Intel (iHD driver) | AMD (mesa) |
+|------|--------------------|------------|
+| VASurfaceAttribExternalBuffers | ✅ VADRTYPE_ALLOCED | ✅ VADRTYPE_DISPLAY |
+| 首选格式 | NV12 | NV12 |
+| 已知问题 | 无 | mesa < 21.0 有 DMA-BUF bug |
+
+**NVIDIA VAAPI**：`nvidia-vaapi-driver` 支持 DMA-BUF 导入，但优选 NVENC 原生路径。
+
 **FFI 方案**：
-- 优先用社区 `vaapi-rs`（如果成熟度够）
-- 否则手写薄 FFI 层，只封装 `libva.so` + `libva-drm.so` 的编码用子集
+- 手写薄 FFI 层，只封装 `libva.so` + `libva-drm.so` 的编码用子集
   - ~20 个函数，struct 布局参考 `va/va.h`
   - `vaGetDisplayDRM`, `vaInitialize`, `vaCreateConfig`, `vaCreateSurfaces`, `vaBeginPicture`, `vaRenderPicture`, `vaEndPicture`, `vaSyncSurface`, `vaGetEncodedBits`, `vaDestroySurfaces`, `vaTerminate`
 
@@ -214,10 +304,27 @@ vaDisplay = vaGetDisplayDRM(drm_fd)  // 或 vaGetDisplay (X11)
 
 XCompositeNameWindowPixmap(dpy, window) → Pixmap
   → XShmGetImage(dpy, pixmap, image, ...) → CPU 像素
-  → 通过 libva 的 vaPutSurface/vaDeriveImage 上传到 GPU surface
+  → 通过 vaPutSurface/vaDeriveImage 上传到 VA surface
+  → VASurfaceAttribExternalBuffers 导入 → VAAPI 编码
 ```
 
-X11 没有 DMA-BUF 零拷贝通道，但功能完整。延迟增加 ~1-2ms（CPU→GPU 上传）。
+**FrameBufferHandle**：X11 路径走 CPU 像素，使用 `CpuBuffer` variant。
+
+**延迟预算**：
+
+| 步骤 | 时间 (1080p) |
+|------|-------------|
+| XShmGetImage (GPU → SHM CPU readback) | 1-3 ms |
+| CPU → GPU 上传 | 0.5-2 ms |
+| X11 round-trip 开销 | 0.2-0.5 ms |
+| **总计** | **~2-6 ms** |
+
+对于 fallback 路径是可接受的。
+
+**注意**：
+- XComposite 需要启用 compositor（无 compositor 时降级到 `XGetImage` 直接捕获）
+- 窗口移动/缩放时需重新调用 `XCompositeNameWindowPixmap`
+- Rust 包用 `x11rb`（选 `x11rb` 而非 `xcb`，前者更 Rust-idiomatic）
 
 ### 系统依赖
 
@@ -251,6 +358,16 @@ CreateDXGIFactory1 → EnumAdapters → EnumOutputs → DuplicateOutput
 
 **Rust 包**：`windows` crate（Microsoft 官方绑定，含 `Graphics.DirectX.Direct3D11` + `Graphics.Dxgi` 命名空间）。
 
+**帧生命周期**：OBS/Chrome 等使用的标准模式——
+```
+AcquireNextFrame() → IDXGIResource
+  → OpenSharedResource(&mut ID3D11Texture2D)  // 创建 texture 的独立 COM 引用
+  → ReleaseFrame()                             // 立即释放 DDA 帧队列跟踪
+  → 将 ID3D11Texture2D 传给 encoder（COM 引用计数独立存在）
+```
+`ReleaseFrame()` 后 texture 仍然有效。FrameBuffer Drop 时 COM 接口自动
+Release，不需要特殊的 release 回调。
+
 ### NVENC 编码
 
 ```
@@ -267,11 +384,11 @@ AMF（AMD）作为备选。
 
 ```
 src/
-├── main.rs                   // 跨平台 CLI + 管线编排
+├── main.rs                   // 跨平台 CLI 解析 + 启动 pipeline
+├── pipeline.rs               // Capture → Encode → WebRTC 管线编排
 ├── lib.rs                    // 暴露 benchmark 接口
-├── capture.rs                // (保留) 未来收拢跨平台实现
 ├── capture/
-│   ├── mod.rs                // ScreenCapture trait + FrameBuffer
+│   ├── mod.rs                // ScreenCapture trait + FrameBuffer 定义
 │   ├── linux.rs              // cfg(target_os = "linux")
 │   │   ├── portal.rs         // D-Bus xdg-desktop-portal 交互
 │   │   ├── pipewire.rs       // PipeWire stream 接收
@@ -279,9 +396,9 @@ src/
 │   ├── windows.rs            // cfg(target_os = "windows")
 │   │   └── dxgi.rs           // DXGI Desktop Duplication
 │   └── macos.rs              // cfg(target_os = "macos")
-│       └── sck.rs            // 现有 ScreenCaptureKit 代码
+│       └── sck.rs            // 现有 ScreenCaptureKit 代码（从原 capture.rs 移入）
 ├── encoder/
-│   ├── mod.rs                // HardwareEncoder trait
+│   ├── mod.rs                // HardwareEncoder trait + #[cfg] 平台模块
 │   ├── linux.rs              // VAAPIEncoder + NvencEncoder
 │   ├── windows.rs            // NvencEncoder + AmfEncoder
 │   └── macos.rs              // 现有 VtEncoder
@@ -290,16 +407,46 @@ src/
 └── update_checker.rs         // 跨平台，不变
 ```
 
+**注意**：`capture.rs` 不再在根目录存在。原有的 macOS `CaptureSession` 移入 `capture/sck.rs`。根目录 `capture/` 作为模块目录，`capture/mod.rs` 定义 trait 并 `pub mod macos;` 等。
+
 ### Cargo.toml 条件依赖
 
+所有 macOS 专用依赖（`screencapturekit`、`videotoolbox`、`apple-cf`）**必须**放在
+`[target.'cfg(target_os = "macos")']` 下，否则 Linux/Windows 会因 unsupported platform 报错。
+
 ```toml
+# ── 跨平台通用依赖 ──
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tiny_http = "0.12"
+ctrlc = "3.4"
+bytes = "1"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
+rustrtc = "0.3"
+rustls = { version = "0.23", features = ["ring"] }
+qrcode = "0.14"
+ureq = "2"
+spin_sleep = "1"
+static_assertions = "1"
+
+# ── macOS ──
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = { version = "8", features = ["macos_14_0"] }
+videotoolbox = "0.18"
+apple-cf = { version = "0.9", default-features = false, features = ["iosurface"] }
+
+# ── Linux ──
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire = "0.9"
-zbus = "4"
-vaapi = "0.2"        # 或手写 FFI
-xcb = "1"
-x11rb = "0.13"
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+drm-fourcc = "2"
+x11rb = { version = "0.13", features = ["shm", "composite"] }
+libc = "0.2"
+# VAAPI/NVENC：手写薄 FFI 层，不依赖外部 crate
 
+# ── Windows ──
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Graphics_DirectX_Direct3D11",
@@ -308,11 +455,14 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_UI_WindowsAndMessaging",
 ] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-screencapturekit = { version = "8", features = ["macos_14_0"] }
-videotoolbox = "0.18"
 ```
+
+**关键变更**：
+- macOS 依赖已全部 `cfg(target_os)` 包裹
+- `zbus` 明确启用 `tokio` feature
+- 去除了 `xcb` crate，只使用 `x11rb`
+- 新增 `drm-fourcc`（DMA-BUF 格式常量）和 `libc`（fd 操作）
+- VAAPI/NVENC 通过手写 FFI 实现，不依赖社区封装
 
 ---
 
@@ -333,13 +483,13 @@ videotoolbox = "0.18"
 3. 实现 DMA-BUF → FrameBuffer
 4. 实现 VAAPI 编码器（FFI 封装）
 5. 集成到主管线
-6. 添加 X11 fallback（`xcb` + XShm）
+6. 添加 X11 fallback（`x11rb` + XShm）
 7. Linux 编译 + 全流程测试
 
 ### 阶段 3 — Windows DXGI + NVENC
 
 1. 实现 DXGI DDA 捕获（`windows` crate）
-2. 实现窗口裁剪（Dw mGetWindowBounds）
+2. 实现窗口裁剪（DwmGetWindowBounds）
 3. 实现 NVENC 编码（FFI）
 4. 集成到主管线
 5. Windows 编译 + 全流程测试
