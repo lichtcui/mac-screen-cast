@@ -48,3 +48,5 @@ pub mod macos;
 mod linux_vaapi;
 #[cfg(target_os = "linux")]
 mod linux_nvenc;
+#[cfg(target_os = "windows")]
+mod windows;

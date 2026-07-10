@@ -46,6 +46,16 @@ drm-fourcc = "2"
 x11rb = { version = "0.13", features = ["shm", "composite"] }
 libc = "0.2"
 
+# ── Windows ──
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D11",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+] }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
