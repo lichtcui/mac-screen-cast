@@ -1,4 +1,5 @@
 mod capture;
+mod encoder;
 mod h264;
 mod server;
 mod update_checker;
