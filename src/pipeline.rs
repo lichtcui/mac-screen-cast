@@ -118,6 +118,7 @@ fn run_pipeline(
     while !stop.load(Ordering::Relaxed) {
         match frame_rx.recv_timeout(Duration::from_millis(100)) {
             Ok((frame, cap_time)) => {
+                frame_count.fetch_add(1, Ordering::Relaxed);
                 let v = wr_version.load(Ordering::Acquire);
                 if v != wr_ver {
                     wr_cached = server::rw_read(&wr_handle).clone();
@@ -153,7 +154,7 @@ fn run_pipeline(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if last_send.elapsed() > Duration::from_secs(3) && send_count > 0 {
-                    eprintln!("\n  No frames for 3s — encoder may have failed");
+                    eprintln!("\n  No frames for 3s -- encoder may have failed");
                     last_send = Instant::now();
                 }
             }

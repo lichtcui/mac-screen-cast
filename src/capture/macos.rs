@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,6 +15,7 @@ use super::{CaptureResult, FrameBuffer, FrameBufferHandle, ScreenCapture};
 /// buffers on certain macOS 26 native-app windows (e.g. Ghostty, Clash Verge).
 pub struct MacosCapture {
     stop: Arc<AtomicBool>,
+    seq: Arc<AtomicU64>,
     join_handle: Option<thread::JoinHandle<()>>,
     filter: SCContentFilter,
     out_w: u32,
@@ -28,6 +29,7 @@ impl ScreenCapture for MacosCapture {
     fn create(options: Self::Options) -> CaptureResult<Self> {
         Ok(MacosCapture {
             stop: Arc::new(AtomicBool::new(false)),
+            seq: Arc::new(AtomicU64::new(0)),
             join_handle: None,
             filter: options.0,
             out_w: options.1,
@@ -49,6 +51,7 @@ impl ScreenCapture for MacosCapture {
 
         let interval = Duration::from_secs_f64(1.0 / f64::from(self.fps));
         let stop = self.stop.clone();
+        let seq = self.seq.clone();
         let filter = self.filter.clone();
         let out_w = self.out_w;
         let out_h = self.out_h;
@@ -64,11 +67,12 @@ impl ScreenCapture for MacosCapture {
                     Ok(sample) => {
                         if let Some(pb) = sample.image_buffer() {
                             if let Some(surface) = pb.io_surface() {
+                                let pts = seq.fetch_add(1, Ordering::Relaxed);
                                 let fb = FrameBuffer {
                                     handle: FrameBufferHandle::IOSurface(surface),
                                     width: out_w,
                                     height: out_h,
-                                    pts: 0,
+                                    pts,
                                     timescale: 1000,
                                     cap_time: Instant::now(),
                                 };
