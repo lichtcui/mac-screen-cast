@@ -47,9 +47,9 @@ pub fn list_windows_json() -> String {
 /// WebRTC video page with real-time latency display.
 ///
 /// Template uses `{{TITLE}}` and `{{FPS}}` placeholders,
-/// defined in `resources/player.html`.
+/// defined in `docs/resources/player.html`.
 pub fn html(fps: u32, title: &str) -> String {
-    include_str!("../resources/player.html")
+    include_str!("../docs/resources/player.html")
         .replace("{{TITLE}}", title)
         .replace("{{FPS}}", &fps.to_string())
 }

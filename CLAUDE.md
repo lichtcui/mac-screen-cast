@@ -65,7 +65,7 @@ Uses [videotoolbox-rs](https://crates.io/crates/videotoolbox). Key patterns:
 
 | Endpoint | Method | Response |
 |----------|--------|----------|
-| `/` | GET | HTML player page (parsed from `resources/player.html`) |
+| `/` | GET | HTML player page (parsed from `docs/resources/player.html`) |
 | `/offer` | GET | SDP offer (text/plain) |
 | `/signal` | POST | `{"status":"ok"}` (JSON) |
 | `/latency` | GET | latency in ms (number, text/plain) |
@@ -80,7 +80,7 @@ Runs on startup in a background thread. Caches the latest GitHub release tag in 
 |--------|------|----------------|
 | `main` | `src/main.rs` | CLI arg parsing (clap), shared state wiring, pipeline orchestration |
 | `capture` | `src/capture.rs` | SCScreenshotManager polling wrapper (filter, config, timing, error throttle) |
-| `server` | `src/server.rs` | HTML player page (`resources/player.html`), window listing via Swift, local IP detection |
+| `server` | `src/server.rs` | HTML player page (`docs/resources/player.html`), window listing via Swift, local IP detection |
 | `h264` | `src/h264.rs` | VideoToolbox CompressionSession wrapper, AVCC NAL parsing, SPS/PPS extraction |
 | `webrtc` | `src/webrtc.rs` | PeerConnection setup, FU-A RTP packetization, track management |
 | `update_checker` | `src/update_checker.rs` | Version check against GitHub releases (background thread, 10s timeout, 24h cache) |
@@ -97,7 +97,7 @@ A split-screen animated WebP (`docs/demo.webp`) shows the CLI + browser stream w
    - Record the full flow: run `mac-screen-cast` → select window → open browser URL
 2. Run the helper script:
    ```bash
-   TRIM_START=0.5 TRIM_END=9 ./scripts/make-demo.sh sample.mov
+   TRIM_START=0.5 TRIM_END=9 ./docs/scripts/make-demo.sh sample.mov
    ```
    The script auto-detects the best encoder path:
    - `libwebp_anim` (ffmpeg built-in)

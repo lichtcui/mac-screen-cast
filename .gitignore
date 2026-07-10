@@ -1,2 +1,4 @@
 /target
-/packages/
+/docs/packages/
+.pi
+.claude
