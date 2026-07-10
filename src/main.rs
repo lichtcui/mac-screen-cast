@@ -12,43 +12,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use screencapturekit::prelude::*;
-use tiny_http::Header;
 
-// ── Content-Type header helpers (hardcoded strings, parse cannot fail) ──
-
-fn header_html() -> Header {
-    "Content-Type: text/html; charset=utf-8"
-        .parse()
-        .expect("valid Content-Type: text/html")
-}
-
-fn header_sdp() -> Header {
-    "Content-Type: application/sdp"
-        .parse()
-        .expect("valid Content-Type: application/sdp")
-}
-
-fn header_json() -> Header {
-    "Content-Type: application/json"
-        .parse()
-        .expect("valid Content-Type: application/json")
-}
-
-fn header_text() -> Header {
-    "Content-Type: text/plain"
-        .parse()
-        .expect("valid Content-Type: text/plain")
-}
-
-/// Helper: acquire RwLock read guard, recovering from a poisoned lock.
-fn rw_read<'a, T>(rw: &'a RwLock<T>) -> std::sync::RwLockReadGuard<'a, T> {
-    rw.read().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Helper: acquire RwLock write guard, recovering from a poisoned lock.
-fn rw_write<'a, T>(rw: &'a RwLock<T>) -> std::sync::RwLockWriteGuard<'a, T> {
-    rw.write().unwrap_or_else(|e| e.into_inner())
-}
 
 // ── CLI argument parsing via clap derive ──
 
@@ -80,7 +44,7 @@ struct Cli {
     width: u32,
 
     /// Target frame rate (1-60)
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=60))]
     fps: u32,
 
     /// HTTP server port
@@ -280,148 +244,6 @@ fn setup_ctrlc_handler(stop: Arc<AtomicBool>, ctrlc_count: Arc<AtomicBool>) {
     .ok();
 }
 
-// ── HTTP server thread ──
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_http_server(
-    port: u16,
-    fps: u32,
-    out_w: u32,
-    out_h: u32,
-    window_name: &str,
-    wr_handle: Arc<RwLock<Option<webrtc::WebRtcHandle>>>,
-    wr_version: Arc<AtomicU64>,
-    wr_connected: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-    latest_latency: Arc<AtomicU64>,
-    webrtc_rt: Arc<tokio::runtime::Runtime>,
-) -> thread::JoinHandle<()> {
-    let ip = server::get_ip();
-    let wn = window_name.to_string();
-
-    eprintln!("  Initializing WebRTC...");
-
-    thread::spawn(move || {
-        use tiny_http::Response;
-        let server = match tiny_http::Server::http(format!("0.0.0.0:{}", port)) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Port {} in use: {}", port, e);
-                return;
-            }
-        };
-        eprintln!("\n  WebRTC stream →  http://{}:{}", ip, port);
-
-        if let Ok(qr) = qrcode::QrCode::new(format!("http://{}:{}", ip, port)) {
-            let w = qr.width();
-            let mut out = String::new();
-            let mut y = 0usize;
-            out.push_str("  \n");
-            while y < w {
-                out.push_str("  ");
-                for x in 0..w {
-                    let top = qr[(x, y)] != qrcode::Color::Light;
-                    let bot = y + 1 < w && qr[(x, y + 1)] != qrcode::Color::Light;
-                    out.push(match (top, bot) {
-                        (true, true) => '█',
-                        (true, false) => '▀',
-                        (false, true) => '▄',
-                        (false, false) => ' ',
-                    });
-                }
-                out.push_str("  \n");
-                y += 2;
-            }
-            out.push_str("  \n");
-            eprintln!("{}", out);
-        }
-
-
-
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let mut req = match server.recv_timeout(Duration::from_millis(500)) {
-                Ok(Some(r)) => r,
-                _ => continue,
-            };
-            let url = req.url();
-            let path = url.split('?').next().unwrap_or("/");
-
-            let resp = match path {
-                "/" => Response::from_data(server::html(fps, &wn).into_bytes())
-                    .with_header(header_html()),
-                "/offer" => {
-                    let was_connected = wr_connected.swap(false, Ordering::Relaxed);
-                    if was_connected {
-                        let old = rw_read(&wr_handle).clone();
-                        if let Some(ref wr) = old {
-                            wr.close();
-                        }
-                        if let Ok(new_handle) =
-                            webrtc::WebRtcHandle::new(webrtc_rt.handle().clone(), fps, out_w, out_h)
-                        {
-                            *rw_write(&wr_handle) = Some(new_handle);
-                            wr_version.fetch_add(1, Ordering::Release);
-                            eprintln!("\n  WebRTC offer recreated for refresh");
-                        } else {
-                            eprintln!("\n  WebRTC recreate failed");
-                        }
-                    }
-                    match rw_read(&wr_handle).as_ref() {
-                        Some(wr) => Response::from_data(wr.offer.clone().into_bytes())
-                            .with_header(header_sdp()),
-                        None => Response::from_data(Vec::from("not ready")).with_status_code(503),
-                    }
-                }
-                "/signal" => {
-                    let mut ok = false;
-                    let mut body = String::new();
-                    if req.as_reader().read_to_string(&mut body).is_ok() {
-                        if let Some(ref wr) = *rw_read(&wr_handle) {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                                if let Some(sdp) = v["sdp"].as_str() {
-                                    if wr.set_answer(sdp.to_string()).is_ok() {
-                                        if let Some(cands) = v["candidates"].as_array() {
-                                            for c in cands {
-                                                let cs = c["candidate"].as_str().unwrap_or("");
-                                                if !cs.is_empty() {
-                                                    let _ = wr.add_candidate(cs);
-                                                }
-                                            }
-                                        }
-                                        wr_connected.store(true, Ordering::Relaxed);
-                                        eprintln!("\n  Signal exchange complete");
-                                        ok = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let (status, body) = if ok {
-                        (200, "{\"status\":\"ok\"}")
-                    } else {
-                        (500, "{\"error\":\"signal failed\"}")
-                    };
-                    Response::from_data(Vec::from(body))
-                        .with_status_code(status)
-                        .with_header(header_json())
-                }
-                "/latency" => {
-                    let ms = latest_latency.load(Ordering::Relaxed);
-                    Response::from_data(format!("{}", ms).into_bytes())
-                        .with_header(header_text())
-                }
-                _ => Response::from_data(Vec::from("{\"error\":\"not found\"}"))
-                    .with_status_code(404)
-                    .with_header(header_json()),
-            };
-            req.respond(resp).ok();
-        }
-    })
-}
-
 // ── Main pipeline: receive encoded frames → WebRTC ──
 
 #[allow(clippy::too_many_arguments)]
@@ -444,7 +266,7 @@ fn run_pipeline(
     let mut prev_cap: u64 = 0;
     let mut prev_send: u64 = 0;
 
-    let mut wr_cached: Option<webrtc::WebRtcHandle> = rw_read(&wr_handle).clone();
+    let mut wr_cached: Option<webrtc::WebRtcHandle> = server::rw_read(&wr_handle).clone();
     let mut wr_ver = wr_version.load(Ordering::Acquire);
 
     while !stop.load(Ordering::Relaxed) {
@@ -452,7 +274,7 @@ fn run_pipeline(
             Ok((frame, cap_time)) => {
                 let v = wr_version.load(Ordering::Acquire);
                 if v != wr_ver {
-                    wr_cached = rw_read(&wr_handle).clone();
+                    wr_cached = server::rw_read(&wr_handle).clone();
                     wr_ver = v;
                 }
 
@@ -576,7 +398,7 @@ fn main() {
     );
 
     // ── HTTP server ──
-    let http_thread = spawn_http_server(
+    let http_thread = server::spawn_http_server(
         cli.port,
         cli.fps,
         out_w,
@@ -596,7 +418,7 @@ fn main() {
         match webrtc::WebRtcHandle::new(rt_handle, cli.fps, out_w, out_h) {
             Ok(handle) => {
                 eprintln!("  WebRTC offer ready");
-                *rw_write(&wr_handle) = Some(handle);
+                *server::rw_write(&wr_handle) = Some(handle);
                 wr_version.fetch_add(1, Ordering::Release);
             }
             Err(e) => eprintln!("  WebRTC init failed: {}", e),

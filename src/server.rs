@@ -1,4 +1,9 @@
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::Duration;
+use tiny_http::{Header, Response};
 
 /// A visible window.
 #[derive(Debug, serde::Serialize)]
@@ -56,19 +61,31 @@ pub fn html(fps: u32, title: &str) -> String {
 
 /// Get local IP address of the default route interface.
 ///
-/// Uses `route get default` to find the primary interface, then queries
-/// its IP with `ipconfig getifaddr`. Falls back to probing en0/en1 directly,
-/// then 127.0.0.1. Typically completes in 2 process spawns instead of 10.
+/// Uses `route -n get default` (parsed in Rust) to find the primary
+/// interface, then queries its IP with `ipconfig getifaddr`.
+/// Falls back to probing en0/en1/en2 directly, then 127.0.0.1.
 pub fn get_ip() -> String {
-    // Find the default route interface name with a single `route get` call
-    let default_iface = Command::new("sh")
-        .arg("-c")
-        .arg("route get default 2>/dev/null | grep 'interface:' | awk '{print $2}'")
+    // Find the default route interface by parsing `route -n get default` output in Rust
+    // (no shell, no grep/awk — pure Rust string parsing)
+    let default_iface = Command::new("route")
+        .args(["-n", "get", "default"])
         .output()
         .ok()
         .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !s.is_empty() { Some(s) } else { None }
+            if !o.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            for line in stdout.lines() {
+                let line = line.trim();
+                if let Some(iface) = line.strip_prefix("interface:") {
+                    let iface = iface.trim();
+                    if !iface.is_empty() {
+                        return Some(iface.to_string());
+                    }
+                }
+            }
+            None
         });
 
     if let Some(ref iface) = default_iface {
@@ -95,6 +112,183 @@ pub fn get_ip() -> String {
     }
 
     String::from("127.0.0.1")
+}
+
+// ── RwLock helpers (recover from poisoned locks) ──
+
+pub(crate) fn rw_read<'a, T>(rw: &'a RwLock<T>) -> std::sync::RwLockReadGuard<'a, T> {
+    rw.read().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn rw_write<'a, T>(rw: &'a RwLock<T>) -> std::sync::RwLockWriteGuard<'a, T> {
+    rw.write().unwrap_or_else(|e| e.into_inner())
+}
+
+// ── Content-Type header helpers (hardcoded strings, parse cannot fail) ──
+
+fn header_html() -> Header {
+    "Content-Type: text/html; charset=utf-8"
+        .parse()
+        .expect("valid Content-Type: text/html")
+}
+
+fn header_sdp() -> Header {
+    "Content-Type: application/sdp"
+        .parse()
+        .expect("valid Content-Type: application/sdp")
+}
+
+fn header_json() -> Header {
+    "Content-Type: application/json"
+        .parse()
+        .expect("valid Content-Type: application/json")
+}
+
+fn header_text() -> Header {
+    "Content-Type: text/plain"
+        .parse()
+        .expect("valid Content-Type: text/plain")
+}
+
+// ── HTTP server thread ──
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_http_server(
+    port: u16,
+    fps: u32,
+    out_w: u32,
+    out_h: u32,
+    window_name: &str,
+    wr_handle: Arc<RwLock<Option<crate::webrtc::WebRtcHandle>>>,
+    wr_version: Arc<AtomicU64>,
+    wr_connected: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    latest_latency: Arc<AtomicU64>,
+    webrtc_rt: Arc<tokio::runtime::Runtime>,
+) -> thread::JoinHandle<()> {
+    let ip = get_ip();
+    let wn = window_name.to_string();
+
+    eprintln!("  Initializing WebRTC...");
+
+    thread::spawn(move || {
+        let server = match tiny_http::Server::http(format!("0.0.0.0:{}", port)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Port {} in use: {}", port, e);
+                return;
+            }
+        };
+        eprintln!("\n  WebRTC stream \u{2192}  http://{}:{}", ip, port);
+
+        if let Ok(qr) = qrcode::QrCode::new(format!("http://{}:{}", ip, port)) {
+            let w = qr.width();
+            let mut out = String::new();
+            let mut y = 0usize;
+            out.push_str("  \n");
+            while y < w {
+                out.push_str("  ");
+                for x in 0..w {
+                    let top = qr[(x, y)] != qrcode::Color::Light;
+                    let bot = y + 1 < w && qr[(x, y + 1)] != qrcode::Color::Light;
+                    out.push(match (top, bot) {
+                        (true, true) => '\u{2588}',
+                        (true, false) => '\u{2580}',
+                        (false, true) => '\u{2584}',
+                        (false, false) => ' ',
+                    });
+                }
+                out.push_str("  \n");
+                y += 2;
+            }
+            out.push_str("  \n");
+            eprintln!("{}", out);
+        }
+
+
+
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut req = match server.recv_timeout(Duration::from_millis(500)) {
+                Ok(Some(r)) => r,
+                _ => continue,
+            };
+            let url = req.url();
+            let path = url.split('?').next().unwrap_or("/");
+
+            let resp = match path {
+                "/" => Response::from_data(html(fps, &wn).into_bytes())
+                    .with_header(header_html()),
+                "/offer" => {
+                    let was_connected = wr_connected.swap(false, Ordering::Relaxed);
+                    if was_connected {
+                        let old = rw_read(&wr_handle).clone();
+                        if let Some(ref wr) = old {
+                            wr.close();
+                        }
+                        if let Ok(new_handle) =
+                            crate::webrtc::WebRtcHandle::new(webrtc_rt.handle().clone(), fps, out_w, out_h)
+                        {
+                            *rw_write(&wr_handle) = Some(new_handle);
+                            wr_version.fetch_add(1, Ordering::Release);
+                            eprintln!("\n  WebRTC offer recreated for refresh");
+                        } else {
+                            eprintln!("\n  WebRTC recreate failed");
+                        }
+                    }
+                    match rw_read(&wr_handle).as_ref() {
+                        Some(wr) => Response::from_data(wr.offer.clone().into_bytes())
+                            .with_header(header_sdp()),
+                        None => Response::from_data(Vec::from("not ready")).with_status_code(503),
+                    }
+                }
+                "/signal" => {
+                    let mut ok = false;
+                    let mut body = String::new();
+                    if req.as_reader().read_to_string(&mut body).is_ok() {
+                        if let Some(ref wr) = *rw_read(&wr_handle) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                                if let Some(sdp) = v["sdp"].as_str() {
+                                    if wr.set_answer(sdp.to_string()).is_ok() {
+                                        if let Some(cands) = v["candidates"].as_array() {
+                                            for c in cands {
+                                                let cs = c["candidate"].as_str().unwrap_or("");
+                                                if !cs.is_empty() {
+                                                    let _ = wr.add_candidate(cs);
+                                                }
+                                            }
+                                        }
+                                        wr_connected.store(true, Ordering::Relaxed);
+                                        eprintln!("\n  Signal exchange complete");
+                                        ok = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let (status, body) = if ok {
+                        (200, "{\"status\":\"ok\"}")
+                    } else {
+                        (500, "{\"error\":\"signal failed\"}")
+                    };
+                    Response::from_data(Vec::from(body))
+                        .with_status_code(status)
+                        .with_header(header_json())
+                }
+                "/latency" => {
+                    let ms = latest_latency.load(Ordering::Relaxed);
+                    Response::from_data(format!("{}", ms).into_bytes())
+                        .with_header(header_text())
+                }
+                _ => Response::from_data(Vec::from("{\"error\":\"not found\"}"))
+                    .with_status_code(404)
+                    .with_header(header_json()),
+            };
+            req.respond(resp).ok();
+        }
+    })
 }
 
 #[cfg(test)]
